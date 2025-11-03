@@ -64,7 +64,7 @@ We expect this package to work on all machines that support all the packages lis
 
 Download the repository and install the requirements
 ```sh
-git clone **missing**
+git clone https://github.com/JFernando4/collas_2025_swr_paper.git
 cd collas_2025_swr_paper
 ```
 
