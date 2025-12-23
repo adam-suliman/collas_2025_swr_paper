@@ -70,7 +70,7 @@ cd collas_2025_swr_paper
 
 Create a virtual environment
 ```sh
-python -m virtualenv ./venv --no-dowload --python=/usr/bin/python3.9.6
+python -m virtualenv ./venv --no-download --python=/usr/bin/python3.9.6
 source ./venv/bin/activate
 pip3 install --no-index --upgrade pip
 ```
