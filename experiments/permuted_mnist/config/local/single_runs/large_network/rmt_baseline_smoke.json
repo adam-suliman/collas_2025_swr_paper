@@ -1,0 +1,26 @@
+{
+  "__comment_1__": "Quick smoke-test config for baseline RMT memory carry.",
+  "stepsize": 0.001,
+  "use_adamw": true,
+  "momentum": 0.9,
+  "beta2": 0.999,
+  "l2_factor": 1e-8,
+  "model_family": "rmt",
+  "rmt_variant": "baseline",
+  "num_permutations": 5,
+  "batch_size": 30,
+  "extended_summaries": true,
+  "rmt_patch_size": 4,
+  "rmt_d_model": 64,
+  "rmt_n_layers": 2,
+  "rmt_n_heads": 4,
+  "rmt_mlp_ratio": 2.0,
+  "rmt_n_mem": 2,
+  "rmt_slow_update_freq": 10,
+  "rmt_memory_reset_at_task_boundary": true,
+  "relevant_parameters": [
+    "model_family",
+    "rmt_variant",
+    "num_permutations"
+  ]
+}

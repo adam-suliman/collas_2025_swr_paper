@@ -1,6 +1,7 @@
 import torch
 import math
 from .torchvision_modified_vit import CustomMLPBlock, VisionTransformer, EncoderBlock
+from .incremental_cifar_rmt_network import MemoryVisionTransformer
 from .reparameterized_layer_norm import ReparameterizedLayerNorm
 
 
@@ -15,6 +16,16 @@ def initialize_vit(network: VisionTransformer):
     torch.nn.init.normal_(network.encoder.pos_embedding, std=0.02)
     network.apply(xavier_vit_initialization)
     initialize_vit_heads(network.heads)
+
+
+def initialize_memory_vit(network: MemoryVisionTransformer):
+    """
+    Initializes a memory-augmented visual transformer.
+    """
+    torch.nn.init.normal_(network.encoder.pos_embedding, std=0.02)
+    network.apply(xavier_vit_initialization)
+    torch.nn.init.zeros_(network.head.weight)
+    torch.nn.init.zeros_(network.head.bias)
 
 
 def xavier_vit_initialization(m: torch.nn.Module):

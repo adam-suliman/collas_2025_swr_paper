@@ -16,13 +16,15 @@ BIN_SIZE = {"test_accuracy_per_epoch": 100, "average_test_accuracy_per_epoch": 1
             "sa_weight_magnitude_median": 1, "mlp_weight_magnitude_median": 1,
             "last_in_projection_weight_magnitude": 1, "last_in_projection_weight_magnitude_median": 1,
             "sa_in_proj_weight_magnitude": 1, "sa_in_proj_weight_magnitude_median": 1,
-            "sa_weight_magnitude_min": 1, "mlp_weight_magnitude_min": 1, "accuracy_per_class_in_order": 1}
+            "sa_weight_magnitude_min": 1, "mlp_weight_magnitude_min": 1, "accuracy_per_class_in_order": 1,
+            "rmt_memory_norm_per_checkpoint": 1, "rmt_memory_update_norm_per_checkpoint": 1}
 AGG_FUNC = {"test_accuracy_per_epoch": "max", "average_test_accuracy_per_epoch": "max", "ln_weight_magnitude": "max",
             "self_attention_weight_magnitude": "max", "mlp_weight_magnitude": "max", "network_parameter_magnitude": "max",
             "sa_weight_magnitude_median": "max", "mlp_weight_magnitude_median": "max",
             "last_in_projection_weight_magnitude": "max", "last_in_projection_weight_magnitude_median": "max",
             "sa_in_proj_weight_magnitude": "max", "sa_in_proj_weight_magnitude_median": "max",
-            "sa_weight_magnitude_min": "max","mlp_weight_magnitude_min": "max", "accuracy_per_class_in_order": "mean"}
+            "sa_weight_magnitude_min": "max","mlp_weight_magnitude_min": "max", "accuracy_per_class_in_order": "mean",
+            "rmt_memory_norm_per_checkpoint": "max", "rmt_memory_update_norm_per_checkpoint": "max"}
 WEIGHT_SUMMARY_NAMES = ["ln_weight_magnitude", "self_attention_weight_magnitude", "mlp_weight_magnitude",
                         "network_parameter_magnitude", "sa_weight_magnitude_median", "mlp_weight_magnitude_median",
                         "last_in_projection_weight_magnitude", "last_in_projection_weight_magnitude_median",
@@ -85,31 +87,38 @@ def create_parameter_combinations_and_table(name_prototype: str, table_parameter
             print(table)
 
 def get_results_data(results_dir: str, measurement_name: str, parameter_combination: list[str],
-                     excluded_indices: dict, max_samples: int = 15):
+                     excluded_indices: dict, max_samples: int = 15,
+                     bin_size_overrides: dict = None, agg_func_overrides: dict = None):
     results = {}
     for pc in parameter_combination:
         pc_excluded_indices = [] if pc not in excluded_indices.keys() else excluded_indices[pc]
-        results[pc] = get_parameter_combination_results(pc, results_dir, measurement_name, pc_excluded_indices, max_samples)
+        results[pc] = get_parameter_combination_results(pc, results_dir, measurement_name, pc_excluded_indices,
+                                                        max_samples, bin_size_overrides, agg_func_overrides)
 
     return results
 
 
 def get_results_data_accuracy_diff(results_dir: str, parameter_combination: list[str], base_lines: list[str],
-                                   excluded_indices: dict, max_samples: int = 15):
+                                   excluded_indices: dict, max_samples: int = 15,
+                                   bin_size_overrides: dict = None, agg_func_overrides: dict = None):
 
     results = {}
     for pc in parameter_combination:
         pc_excluded_indices = [] if pc not in excluded_indices.keys() else excluded_indices[pc]
-        pc_results = get_parameter_combination_results(pc, results_dir, "test_accuracy_per_epoch", pc_excluded_indices, max_samples)
+        pc_results = get_parameter_combination_results(pc, results_dir, "test_accuracy_per_epoch", pc_excluded_indices,
+                                                       max_samples, bin_size_overrides, agg_func_overrides)
         baseline_max_samples = pc_results.shape[0]
-        baseline_results = get_parameter_combination_results(base_lines[pc], results_dir, "test_accuracy_per_epoch", pc_excluded_indices, baseline_max_samples)
+        baseline_results = get_parameter_combination_results(base_lines[pc], results_dir, "test_accuracy_per_epoch",
+                                                             pc_excluded_indices, baseline_max_samples,
+                                                             bin_size_overrides, agg_func_overrides)
         results[pc] = pc_results - baseline_results
 
     return results
 
 
 def get_parameter_combination_results(parameter_comb, results_dir, measurement_name, pc_excluded_indices: list,
-                                      max_samples: int = 15):
+                                      max_samples: int = 15, bin_size_overrides: dict = None,
+                                      agg_func_overrides: dict = None):
     assert measurement_name in BIN_SIZE.keys() and measurement_name in AGG_FUNC.keys()
     if DEBUG: print(f"\nParameter combination: {parameter_comb}")
 
@@ -119,7 +128,15 @@ def get_parameter_combination_results(parameter_comb, results_dir, measurement_n
     indices.sort()
     measurement_dir = os.path.join(temp_results_dir, measurement_name)
 
-    bin_size = BIN_SIZE[measurement_name]
+    bin_size_overrides = {} if bin_size_overrides is None else bin_size_overrides
+    agg_func_overrides = {} if agg_func_overrides is None else agg_func_overrides
+
+    bin_size = int(bin_size_overrides.get(measurement_name, BIN_SIZE[measurement_name]))
+    if bin_size <= 0:
+        raise ValueError(f"bin size for {measurement_name} must be >= 1, got {bin_size}.")
+    agg_func = agg_func_overrides.get(measurement_name, AGG_FUNC[measurement_name])
+    if agg_func not in ["mean", "max", "median", "min"]:
+        raise ValueError(f"Unsupported aggregation function: {agg_func}")
     temp_results = []
 
     current_sample = 0
@@ -135,7 +152,15 @@ def get_parameter_combination_results(parameter_comb, results_dir, measurement_n
                 print(f"\n{filename = }\nParameter combination = {parameter_comb}\nMeasurement = {measurement_name}")
                 print(f"\n{results_dir = }\n")
             raise EOFError
-        temp_results.append(aggregate_over_bins(temp_measurement_array, bin_size, agg_func=AGG_FUNC[measurement_name]))
+        temp_bin_size = bin_size
+        if (temp_measurement_array.size % temp_bin_size) != 0:
+            # Smoke runs are shorter than default binning (e.g., 20 epochs vs 100). Fall back to no binning.
+            print(
+                f"[incremental_cifar_analysis] {measurement_name} size={temp_measurement_array.size} "
+                f"is not divisible by bin_size={temp_bin_size}. Falling back to bin_size=1."
+            )
+            temp_bin_size = 1
+        temp_results.append(aggregate_over_bins(temp_measurement_array, temp_bin_size, agg_func=agg_func))
 
         if DEBUG: print(f"index: {idx}\tLast task performance: {temp_results[-1][-1]}")
         current_sample += 1
@@ -259,27 +284,41 @@ def analyse_results(analysis_parameters: dict, save_plots: bool = True):
     plot_parameters = access_dict(analysis_parameters, "plot_parameters", default={}, val_type=dict)
     plot_name_prefix = access_dict(analysis_parameters, "plot_name_prefix", default="", val_type=str)
     table_parameters = access_dict(analysis_parameters, "table_parameters", default={}, val_type=dict)
+    bin_size_overrides = access_dict(analysis_parameters, "bin_size_overrides", default={}, val_type=dict)
+    agg_func_overrides = access_dict(analysis_parameters, "agg_func_overrides", default={}, val_type=dict)
 
     for sn in summary_names:
 
         if sn == "test_accuracy_per_epoch":
-            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices, max_samples)
+            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices, max_samples,
+                                            bin_size_overrides, agg_func_overrides)
             plot_results(results_data, plot_parameters, plot_dir, sn, save_plots, plot_name_prefix)
         if sn == "accuracy_per_class_in_order":
-            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices, max_samples)
+            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices, max_samples,
+                                            bin_size_overrides, agg_func_overrides)
             compute_correlation_of_accuracy_vs_class_order(results_data, None if "labels" not in plot_parameters.keys() else plot_parameters["labels"])
         elif sn == "average_test_accuracy_per_epoch":
-            results_data = get_results_data(results_dir, "test_accuracy_per_epoch", parameter_combinations, excluded_indices, max_samples)
+            results_data = get_results_data(results_dir, "test_accuracy_per_epoch", parameter_combinations,
+                                            excluded_indices, max_samples, bin_size_overrides, agg_func_overrides)
             print_average_test_accuracy(results_data)
         elif sn == "test_accuracy_with_baseline":
-            results_data = get_results_data_accuracy_diff(results_dir, parameter_combinations, base_lines, excluded_indices, max_samples)
+            results_data = get_results_data_accuracy_diff(results_dir, parameter_combinations, base_lines,
+                                                          excluded_indices, max_samples, bin_size_overrides,
+                                                          agg_func_overrides)
             plot_results(results_data, plot_parameters, plot_dir, sn, save_plots, plot_name_prefix)
         elif sn in WEIGHT_SUMMARY_NAMES:
             if compute_weight_magnitude_summaries:
                 for param_comb in parameter_combinations:
                     compute_and_store_weight_magnitude_results(param_comb, results_dir)
                 compute_weight_magnitude_summaries = False
-            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices=excluded_indices, max_samples=max_samples)
+            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices=excluded_indices,
+                                            max_samples=max_samples, bin_size_overrides=bin_size_overrides,
+                                            agg_func_overrides=agg_func_overrides)
+            plot_results(results_data, plot_parameters, plot_dir, sn, save_plots, plot_name_prefix)
+        elif sn in ["rmt_memory_norm_per_checkpoint", "rmt_memory_update_norm_per_checkpoint"]:
+            results_data = get_results_data(results_dir, sn, parameter_combinations, excluded_indices=excluded_indices,
+                                            max_samples=max_samples, bin_size_overrides=bin_size_overrides,
+                                            agg_func_overrides=agg_func_overrides)
             plot_results(results_data, plot_parameters, plot_dir, sn, save_plots, plot_name_prefix)
         elif sn == "parameter_sweep":
             assert len(parameter_combinations) == 1

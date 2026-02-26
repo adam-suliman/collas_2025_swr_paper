@@ -1,0 +1,50 @@
+{
+  "results_dir": "./results/vit_incremental_cifar/parameter_sweeps/incremental_cifar/",
+  "parameter_combinations": [
+    "reparam_ln-True_replacement_rate-1e-06_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-1e-06_maturity_threshold-10000",
+    "reparam_ln-True_replacement_rate-1e-07_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-1e-07_maturity_threshold-10000",
+    "reparam_ln-True_replacement_rate-1e-08_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-1e-08_maturity_threshold-10000",
+    "reparam_ln-True_replacement_rate-5e-07_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-5e-07_maturity_threshold-10000",
+    "reparam_ln-True_replacement_rate-5e-08_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-5e-08_maturity_threshold-10000"
+  ],
+  "summary_names": ["test_accuracy_per_epoch"],
+  "excluded_indices": {},
+  "max_samples": 5,
+  "plot_dir": "./plots/incremental_cifar/parameter_sweeps/cbp/",
+  "plot_parameters": {
+    "x_label": "Number of Classes",
+    "y_label": "Best accuracy per task",
+    "xlim": [-0.5, 19.5],
+    "xticks": [0, 4, 9, 14, 19],
+    "labels": [
+      "rr=1e-6, mt=1000",
+      "rr=1e-6, mt=10000",
+      "rr=1e-7, mt=1000",
+      "rr=1e-7, mt=10000",
+      "rr=1e-8, mt=1000",
+      "rr=1e-8, mt=10000",
+      "rr=5e-7, mt=1000",
+      "rr=5e-7, mt=10000",
+      "rr=5e-8, mt=1000",
+      "rr=5e-8, mt=10000"
+    ],
+    "color_order": [
+      "black",
+      "blue",
+      "blue_green",
+      "green",
+      "orange",
+      "vermilion",
+      "sky_blue",
+      "red",
+      "gray",
+      "pale_violet"
+    ]
+  },
+  "plot_name_prefix": "cbp_complete_now"
+}

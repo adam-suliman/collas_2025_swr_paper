@@ -1,0 +1,16 @@
+{
+  "results_dir": "./results/vit_incremental_cifar/parameter_sweeps/incremental_cifar/",
+  "parameter_combinations": [
+    "reparam_ln-True_replacement_rate-1e-06_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-1e-07_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-1e-08_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-1e-08_maturity_threshold-10000",
+    "reparam_ln-True_replacement_rate-5e-07_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-5e-07_maturity_threshold-10000",
+    "reparam_ln-True_replacement_rate-5e-08_maturity_threshold-1000",
+    "reparam_ln-True_replacement_rate-5e-08_maturity_threshold-10000"
+  ],
+  "summary_names": ["average_test_accuracy_per_epoch"],
+  "excluded_indices": {},
+  "max_samples": 5
+}

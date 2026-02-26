@@ -18,7 +18,7 @@ from mlproj_manager.util.experiments_util import access_dict
 
 # from source
 from src.networks.torchvision_modified_vit import VisionTransformer
-from src.networks import ReparameterizedLayerNorm
+from src.networks import MemoryVisionTransformer, ReparameterizedLayerNorm
 from src.utils import parse_plots_and_analysis_terminal_arguments
 
 DEBUG = False
@@ -88,14 +88,29 @@ def load_cifar_data(data_path: str, train: bool = True) -> (CifarDataSet, DataLo
 
 
 # -------------------- For computing analysis of the network -------------------- #
+def _get_model_device(net: torch.nn.Module) -> torch.device:
+    if hasattr(net, "heads"):
+        return net.heads[0].weight.device
+    return net.head.weight.device
+
+
 @torch.no_grad()
-def compute_dormant_units_proportion(net: VisionTransformer, cifar_data_loader: DataLoader, epsilon: float = 0.01):
+def _forward_for_analysis(net: torch.nn.Module, image: torch.Tensor, model_family: str, activations: list = None):
+    if model_family == "rmt":
+        memory = torch.zeros(net.n_mem, net.hidden_dim, device=image.device, dtype=torch.float32)
+        return net.forward(image, memory, activations=activations)
+    return net.forward(image, activations)
+
+
+@torch.no_grad()
+def compute_dormant_units_proportion(net: torch.nn.Module, cifar_data_loader: DataLoader, model_family: str,
+                                     epsilon: float = 0.01):
     """
     Computes the proportion of dormant units in a VisionTrandformer. It also returns the features of the last layer for the first
     1000 samples
     """
 
-    device = net.heads[0].weight.device
+    device = _get_model_device(net)
     features_per_layer = []
     last_layer_activations = None
     num_samples = 1000
@@ -103,7 +118,7 @@ def compute_dormant_units_proportion(net: VisionTransformer, cifar_data_loader: 
     for i, sample in enumerate(cifar_data_loader):
         image = sample["image"].to(device)
         temp_features = []
-        net.forward(image, temp_features)
+        _forward_for_analysis(net, image, model_family=model_family, activations=temp_features)
 
         features_per_layer = temp_features
         last_layer_activations = temp_features[-1][:, 0,:].cpu()
@@ -127,7 +142,8 @@ def compute_stable_rank(singular_values: np.ndarray):
 
 @torch.no_grad()
 def compute_last_task_accuracy_per_class_in_order(net: torch.nn.Module, ordered_classes: np.ndarray,
-                                                  test_data: DataLoader, experiment_index: int):
+                                                  test_data: DataLoader, experiment_index: int,
+                                                  model_family: str = "vit"):
     """
     Computes the accuracy of each class in the order they were presented
     :param net: resnet with the parameters stored at the end of the experiment
@@ -137,7 +153,7 @@ def compute_last_task_accuracy_per_class_in_order(net: torch.nn.Module, ordered_
     """
 
     ordered_classes = np.int32(ordered_classes)
-    device = net.heads[0].weight.device
+    device = _get_model_device(net)
     num_classes = 100
     num_examples_per_class = 100
 
@@ -145,7 +161,7 @@ def compute_last_task_accuracy_per_class_in_order(net: torch.nn.Module, ordered_
     for i, sample in enumerate(test_data):
         image = sample["image"].to(device)
         labels = sample["label"].to(device)
-        outputs = net(image)
+        outputs = _forward_for_analysis(net, image, model_family=model_family)
         _, predicted = torch.max(outputs, 1)    # Get the class with the highest score
         _, labels = torch.max(labels, 1)        # Get the class with the highest score
 
@@ -197,8 +213,14 @@ def analyze_results(analysis_parameters: dict):
     results_dir = analysis_parameters["results_dir"]
     data_path = analysis_parameters["data_path"]
     net_parameters = analysis_parameters["net_parameters"]
-    dormant_unit_threshold = access_dict(analysis_parameters, "dormant_units_results", default=0.01, val_type=float)
+    dormant_unit_threshold = access_dict(
+        analysis_parameters,
+        "dormant_unit_threshold",
+        default=access_dict(analysis_parameters, "dormant_units_results", default=0.01, val_type=float),
+        val_type=float
+    )
     excluded_indices = access_dict(analysis_parameters, "excluded_indices", default=[], val_type=list)
+    model_family = access_dict(net_parameters, "model_family", default="vit", val_type=str, choices=["vit", "rmt"])
 
     parameter_dir_path = os.path.join(results_dir, "model_parameters")
     experiment_indices_file_path = os.path.join(results_dir, "experiment_indices.npy")
@@ -211,7 +233,27 @@ def analyze_results(analysis_parameters: dict):
     last_epoch = 2000
     experiment_indices = np.load(experiment_indices_file_path)
 
-    net = VisionTransformer(
+    dropout = access_dict(net_parameters, "dropout", default=0.1, val_type=float)
+    use_reparam_ln = access_dict(net_parameters, "reparam_ln", default=False, val_type=bool)
+    norm_layer = ReparameterizedLayerNorm if use_reparam_ln else torch.nn.LayerNorm
+
+    if model_family == "rmt":
+        rmt_d_model = access_dict(net_parameters, "rmt_d_model", default=384, val_type=int)
+        net = MemoryVisionTransformer(
+            image_size=32,
+            patch_size=access_dict(net_parameters, "rmt_patch_size", default=4, val_type=int),
+            num_layers=access_dict(net_parameters, "rmt_n_layers", default=8, val_type=int),
+            num_heads=access_dict(net_parameters, "rmt_n_heads", default=12, val_type=int),
+            hidden_dim=rmt_d_model,
+            mlp_dim=int(rmt_d_model * access_dict(net_parameters, "rmt_mlp_ratio", default=4.0, val_type=float)),
+            num_classes=100,
+            n_mem=access_dict(net_parameters, "rmt_n_mem", default=2, val_type=int),
+            dropout=dropout,
+            attention_dropout=dropout,
+            norm_layer=norm_layer,
+        )
+    else:
+        net = VisionTransformer(
             image_size=32,
             patch_size=4,
             num_layers=8,
@@ -219,15 +261,14 @@ def analyze_results(analysis_parameters: dict):
             hidden_dim=384,
             mlp_dim=1536,
             num_classes=100,
-            dropout=net_parameters["dropout"],
-            attention_dropout=net_parameters["dropout"],
-            norm_layer=ReparameterizedLayerNorm if net_parameters["reparam_ln"] else torch.nn.LayerNorm,
+            dropout=dropout,
+            attention_dropout=dropout,
+            norm_layer=norm_layer,
             replacement_rate=None if "replacement_rate" not in net_parameters else net_parameters["replacement_rate"],
             maturity_threshold=None if "maturity_threshold" not in net_parameters else net_parameters["maturity_threshold"],
             reinit_frequency=None if "reinit_frequency" not in net_parameters else net_parameters["reinit_frequency"],
             reinit_threshold=None if "reinit_threshold" not in net_parameters else net_parameters["reinit_threshold"],
-
-    )
+        )
     net.to(device)
     net.eval()
     cifar_data, cifar_data_loader = load_cifar_data(data_path, train=True)
@@ -254,7 +295,9 @@ def analyze_results(analysis_parameters: dict):
             current_classes = ordered_classes[(i * classes_per_task):((i + 1) * classes_per_task)]
             cifar_data.select_new_partition(current_classes)
 
-            prop_dormant, last_layer_features = compute_dormant_units_proportion(net, cifar_data_loader, dormant_unit_threshold)
+            prop_dormant, last_layer_features = compute_dormant_units_proportion(
+                net, cifar_data_loader, model_family=model_family, epsilon=dormant_unit_threshold
+            )
             dormant_units_prop_after[i] = prop_dormant
             singular_values = svd(last_layer_features, compute_uv=False, lapack_driver="gesvd")
             stable_rank_after[i] = compute_stable_rank(singular_values)
@@ -263,15 +306,18 @@ def analyze_results(analysis_parameters: dict):
             if i == 0: continue
             current_classes = ordered_classes[:(i * classes_per_task)]
             cifar_data.select_new_partition(current_classes)
-            prop_dormant, last_layer_features = compute_dormant_units_proportion(net, cifar_data_loader, dormant_unit_threshold)
+            prop_dormant, last_layer_features = compute_dormant_units_proportion(
+                net, cifar_data_loader, model_family=model_family, epsilon=dormant_unit_threshold
+            )
 
             dormant_units_prop_before[i] = prop_dormant
             singular_values = svd(last_layer_features, compute_uv=False, lapack_driver="gesvd")
             stable_rank_before[i] = compute_stable_rank(singular_values)
 
         net.load_state_dict(load_model_parameters(parameter_dir_path, exp_index, last_epoch))
-        accuracy_per_class_in_order = compute_last_task_accuracy_per_class_in_order(net, ordered_classes,
-                                                                                    test_data_loader, exp_index)
+        accuracy_per_class_in_order = compute_last_task_accuracy_per_class_in_order(
+            net, ordered_classes, test_data_loader, exp_index, model_family=model_family
+        )
 
         store_analysis_results(dormant_units_results=(dormant_units_prop_before, dormant_units_prop_after),
                                stable_rank_results=(stable_rank_before, stable_rank_after),

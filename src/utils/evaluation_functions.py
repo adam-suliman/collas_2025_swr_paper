@@ -41,6 +41,8 @@ def compute_average_gradient_magnitude(model: torch.nn.Module) -> float:
             grad_magnitude_summ += p.grad.abs().sum()
             total_params += p.numel()
 
+    if total_params == 0:
+        return 0.0
     return float(grad_magnitude_summ / total_params)
 
 

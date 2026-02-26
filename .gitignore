@@ -12,3 +12,4 @@ share/
 *.pyc
 data/
 .DS_Store
+rmt-continuous-learning-MVP.ipynb

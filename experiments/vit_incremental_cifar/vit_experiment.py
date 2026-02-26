@@ -1,24 +1,29 @@
 # built-in libraries
-import time
 import os
+import pickle
+import time
+from copy import deepcopy
+
 # third party libraries
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
-import numpy as np
 from tqdm import tqdm
+
 # from ml project manager
 from mlproj_manager.problems import CifarDataSet
-from mlproj_manager.util import turn_off_debugging_processes, access_dict
-# project files
-from src import initialize_vit, initialize_vit_heads, initialize_layer_norm_module, initialize_multihead_self_attention_module, initialize_mlp_block
-from src.utils import get_cifar_data, compute_accuracy_from_batch
-from src.networks.torchvision_modified_vit import VisionTransformer
-from src.networks import ReparameterizedLayerNorm, perturb_weights
-from src import parse_terminal_arguments
+from mlproj_manager.util import access_dict, turn_off_debugging_processes
 
-from src.utils import save_model_parameters, set_random_seed
-from src.swr_functions import get_network_init_parameters, SelectiveWeightReinitialization
+# project files
+from src import (initialize_layer_norm_module, initialize_memory_vit, initialize_mlp_block,
+                 initialize_multihead_self_attention_module, initialize_vit, initialize_vit_heads,
+                 parse_terminal_arguments)
+from src.networks import MemoryVisionTransformer, ReparameterizedLayerNorm, perturb_weights
+from src.networks.torchvision_modified_vit import VisionTransformer
+from src.swr_functions import SelectiveWeightReinitialization, get_network_init_parameters
 from src.utils import IncrementalCIFARExperimentBase
+from src.utils import compute_accuracy_from_batch, get_cifar_data
+from src.utils import save_model_parameters, set_random_seed
 
 
 class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
@@ -32,10 +37,10 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         gpu_index = access_dict(exp_params, "gpu_index", default=gpu_index, val_type=int)
         self.device = torch.device(f"cuda:{gpu_index}" if torch.cuda.is_available() else "cpu")
 
-        """ For reproducibility """
+        # For reproducibility
         set_random_seed(self.run_index)
 
-        """ Experiment parameters """
+        # Experiment parameters
         self.data_path = exp_params["data_path"]
 
         # problem definition parameters
@@ -55,6 +60,13 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.use_lr_schedule = access_dict(exp_params, "use_lr_schedule", default=True, val_type=bool)
         self.dropout_prob = access_dict(exp_params, "dropout_prob", default=0.05, val_type=float)
 
+        # summary parameters
+        self.extended_summaries = access_dict(exp_params, "extended_summaries", default=False, val_type=bool)
+
+        # model selection
+        self.model_family = access_dict(exp_params, "model_family", default="vit", val_type=str,
+                                        choices=["vit", "rmt"])
+
         # network resetting parameters
         self.reset_head = access_dict(exp_params, "reset_head", default=False, val_type=bool)
         self.reset_network = access_dict(exp_params, "reset_network", default=False, val_type=bool)
@@ -68,10 +80,14 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         # SWR parameters
         self.reinit_freq = access_dict(exp_params, "reinit_freq", default=0, val_type=int)
         self.reinit_factor = access_dict(exp_params, "reinit_factor", default=0.0, val_type=float)
-        self.utility_function = access_dict(exp_params, "utility_function", default="none", val_type=str, choices=[ "none", "magnitude", "gradient"])
-        self.pruning_method = access_dict(exp_params, "pruning_method", default="none", val_type=str, choices=["none", "proportional", "threshold"])
-        self.reinit_strat = access_dict(exp_params, "reinit_strat", default="none", val_type=str, choices=["none", "mean", "resample"])
-        self.use_swr = (self.pruning_method != "none") and (self.reinit_strat != "none") and (self.reinit_freq > 0) and (self.reinit_factor > 0.0)
+        self.utility_function = access_dict(exp_params, "utility_function", default="none", val_type=str,
+                                            choices=["none", "magnitude", "gradient"])
+        self.pruning_method = access_dict(exp_params, "pruning_method", default="none", val_type=str,
+                                          choices=["none", "proportional", "threshold"])
+        self.reinit_strat = access_dict(exp_params, "reinit_strat", default="none", val_type=str,
+                                        choices=["none", "mean", "resample"])
+        self.use_swr = (self.pruning_method != "none") and (self.reinit_strat != "none") and (
+            self.reinit_freq > 0) and (self.reinit_factor > 0.0)
 
         # CBP parameters
         self.replacement_rate = access_dict(exp_params, "replacement_rate", default=None, val_type=float)
@@ -83,37 +99,47 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.redo_reinit_threshold = access_dict(exp_params, "redo_reinit_threshold", default=None, val_type=float)
         self.use_redo = (self.redo_reinit_frequency is not None) and (self.redo_reinit_threshold is not None)
 
+        # RMT parameters
+        self.rmt_variant = access_dict(exp_params, "rmt_variant", default="fast_memory", val_type=str,
+                                       choices=["baseline", "fast_memory"])
+        self.rmt_patch_size = access_dict(exp_params, "rmt_patch_size", default=4, val_type=int)
+        self.rmt_d_model = access_dict(exp_params, "rmt_d_model", default=384, val_type=int)
+        self.rmt_n_layers = access_dict(exp_params, "rmt_n_layers", default=8, val_type=int)
+        self.rmt_n_heads = access_dict(exp_params, "rmt_n_heads", default=12, val_type=int)
+        self.rmt_mlp_ratio = access_dict(exp_params, "rmt_mlp_ratio", default=4.0, val_type=float)
+        self.rmt_n_mem = access_dict(exp_params, "rmt_n_mem", default=2, val_type=int)
+        self.rmt_fast_lr = access_dict(exp_params, "rmt_fast_lr", default=0.1, val_type=float)
+        self.rmt_slow_update_freq = access_dict(exp_params, "rmt_slow_update_freq", default=10, val_type=int)
+        self.rmt_memory_reset_at_task_boundary = access_dict(exp_params, "rmt_memory_reset_at_task_boundary",
+                                                             default=True, val_type=bool)
+        # access_dict enforces exact types for existing keys; allow explicit null in JSON for this optional field.
+        clip_grad_value = exp_params["rmt_clip_memory_grad"] if "rmt_clip_memory_grad" in exp_params else None
+        if clip_grad_value is not None and not isinstance(clip_grad_value, (float, int)):
+            raise ValueError("rmt_clip_memory_grad must be null or a numeric value.")
+        self.rmt_clip_memory_grad = None if clip_grad_value is None else float(clip_grad_value)
+        if self.rmt_slow_update_freq <= 0:
+            raise ValueError("rmt_slow_update_freq must be >= 1.")
+
         # shrink and perturb parameters
         self.parameter_noise_var = access_dict(exp_params, "parameter_noise_var", default=0.0, val_type=float)
         self.use_parameter_noise = self.parameter_noise_var > 0.0
 
-        """ Training constants """
-        self.batch_sizes = {"train": 90, "test": 100, "validation":50}
+        # Training constants
+        self.batch_sizes = {"train": 90, "test": 100, "validation": 50}
         self.num_classes = 100
         self.image_dims = (32, 32, 3)
         self.num_images_per_epoch = 50000
         self.num_images_per_class = 450
-        self.num_workers = 1 if self.device.type == "cpu" else 12   # for the data loader, change this to number of available cpus
+        self.num_workers = 1 if self.device.type == "cpu" else 12
 
-        """ Network set up """
-        # initialize network
-        self.net = VisionTransformer(
-            image_size=32,
-            patch_size=4,
-            num_layers=8,
-            num_heads=12,
-            hidden_dim=384,
-            mlp_dim=1536,
-            num_classes=self.num_classes,
-            dropout=self.dropout_prob,
-            attention_dropout=self.dropout_prob,
-            replacement_rate=self.replacement_rate,
-            maturity_threshold=self.maturity_threshold,
-            reinit_frequency=self.redo_reinit_frequency,
-            reinit_threshold=self.redo_reinit_threshold,
-            norm_layer=ReparameterizedLayerNorm if self.reparam_ln else torch.nn.LayerNorm
-        )
-        initialize_vit(self.net)
+        # Explicitly disable reinitialization methods in RMT mode.
+        if self.model_family == "rmt":
+            self.use_swr = False
+            self.use_cbp = False
+            self.use_redo = False
+
+        # Network set up
+        self.net = self._build_vit_model() if self.model_family == "vit" else self._build_rmt_model()
         self.net.to(self.device)
 
         # initialize optimizer and loss function
@@ -138,115 +164,234 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.current_epoch = 0
         self.current_minibatch = 0
 
-        """ For data partitioning """
+        # For data partitioning
         self.class_increase = access_dict(exp_params, "class_increase", default=5, val_type=int)
-        self.class_increase_frequency = 100
-        self.all_classes = np.random.permutation(self.num_classes)  # define order classes
+        self.class_increase_frequency = access_dict(exp_params, "class_increase_frequency", default=100, val_type=int)
+        self.all_classes = np.random.permutation(self.num_classes)
         self.best_accuracy = torch.tensor(0.0, device=self.device, dtype=torch.float32)
         self.best_loss = torch.ones_like(self.best_accuracy) * torch.inf
         self.best_model_parameters = {}
 
-        """ For creating experiment checkpoints """
+        # RMT state
+        self.rmt_memory = None
+        self.rmt_global_step = 0
+        self.rmt_optimizer_step_count = 0
+        self.rmt_running_memory_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        self.rmt_running_memory_update_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
+        # For creating experiment checkpoints
         self.experiment_checkpoints_dir_path = os.path.join(self.results_dir, "experiment_checkpoints")
         self.checkpoint_identifier_name = "current_epoch"
-        self.checkpoint_save_frequency = self.class_increase_frequency  # save every time a new class is added
+        self.checkpoint_save_frequency = self.class_increase_frequency
         self.delete_old_checkpoints = True
 
-        """ For summaries """
+        # For summaries
         self.running_avg_window = 25
         self.current_running_avg_step, self.running_loss, self.running_accuracy = (0, 0.0, 0.0)
         self._initialize_summaries()
+        self._initialize_rmt_summaries_if_needed()
 
-    # ------------------------------ Methods for initializing the experiment ------------------------------
+    def _build_vit_model(self) -> VisionTransformer:
+        net = VisionTransformer(
+            image_size=32,
+            patch_size=4,
+            num_layers=8,
+            num_heads=12,
+            hidden_dim=384,
+            mlp_dim=1536,
+            num_classes=self.num_classes,
+            dropout=self.dropout_prob,
+            attention_dropout=self.dropout_prob,
+            replacement_rate=self.replacement_rate,
+            maturity_threshold=self.maturity_threshold,
+            reinit_frequency=self.redo_reinit_frequency,
+            reinit_threshold=self.redo_reinit_threshold,
+            norm_layer=ReparameterizedLayerNorm if self.reparam_ln else torch.nn.LayerNorm,
+        )
+        initialize_vit(net)
+        return net
+
+    def _build_rmt_model(self) -> MemoryVisionTransformer:
+        net = MemoryVisionTransformer(
+            image_size=32,
+            patch_size=self.rmt_patch_size,
+            num_layers=self.rmt_n_layers,
+            num_heads=self.rmt_n_heads,
+            hidden_dim=self.rmt_d_model,
+            mlp_dim=int(self.rmt_d_model * self.rmt_mlp_ratio),
+            num_classes=self.num_classes,
+            n_mem=self.rmt_n_mem,
+            dropout=self.dropout_prob,
+            attention_dropout=self.dropout_prob,
+            norm_layer=ReparameterizedLayerNorm if self.reparam_ln else torch.nn.LayerNorm,
+        )
+        initialize_memory_vit(net)
+        return net
+
+    def _initialize_rmt_summaries_if_needed(self):
+        if self.model_family != "rmt" or not self.extended_summaries:
+            return
+        total_ckpts = self.results_dict["train_loss_per_checkpoint"].shape[0]
+        defaults = {"device": self.device, "dtype": torch.float32}
+        self.results_dict["rmt_memory_norm_per_checkpoint"] = torch.zeros(total_ckpts, **defaults)
+        self.results_dict["rmt_memory_update_norm_per_checkpoint"] = torch.zeros(total_ckpts, **defaults)
+
+    def _initialize_rmt_memory(self, requires_grad: bool = None) -> torch.Tensor:
+        if requires_grad is None:
+            requires_grad = self.rmt_variant == "fast_memory"
+        memory = torch.zeros(self.rmt_n_mem, self.rmt_d_model, device=self.device, dtype=torch.float32)
+        return memory.requires_grad_(requires_grad)
+
+    def _store_rmt_extended_summaries(self, memory_norm: torch.Tensor, memory_update_norm: torch.Tensor):
+        if not self.extended_summaries:
+            return
+        self.rmt_running_memory_norm += memory_norm.detach()
+        self.rmt_running_memory_update_norm += memory_update_norm.detach()
+
+    def _store_training_summaries(self):
+        super()._store_training_summaries()
+        if self.model_family != "rmt" or not self.extended_summaries:
+            return
+        idx = self.current_running_avg_step - 1
+        self.results_dict["rmt_memory_norm_per_checkpoint"][idx] += self.rmt_running_memory_norm / self.running_avg_window
+        self.results_dict["rmt_memory_update_norm_per_checkpoint"][idx] += self.rmt_running_memory_update_norm / self.running_avg_window
+        self.rmt_running_memory_norm *= 0.0
+        self.rmt_running_memory_update_norm *= 0.0
+
     def _get_optimizer(self):
         """ Creates optimizer object based on the experiment parameters """
         if self.wd_on_1d_params:
             wd = self.weight_decay if self.rescaled_wd else self.weight_decay / self.stepsize
             params = self.net.parameters()
             return torch.optim.SGD(params, lr=self.stepsize, momentum=self.momentum, weight_decay=wd)
-        else:
-            # from Andrej Karpathy's nanoGPT repo: https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py (lines 179-202)
-            # start with all the candidate parameters (that require grad)
-            param_dict = {pn: p for pn, p in self.net.named_parameters() if p.requires_grad}
-            # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-            optim_groups = [{'params': decay_params, 'weight_decay': self.weight_decay}, {'params': nodecay_params, 'weight_decay': 0.0}]
-            return torch.optim.SGD(optim_groups, lr=self.stepsize, momentum=self.momentum)
 
-    # ------------------------------------- For running the experiment ------------------------------------- #
+        param_dict = {pn: p for pn, p in self.net.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [{"params": decay_params, "weight_decay": self.weight_decay},
+                        {"params": nodecay_params, "weight_decay": 0.0}]
+        return torch.optim.SGD(optim_groups, lr=self.stepsize, momentum=self.momentum)
+
+    def get_experiment_checkpoint(self):
+        checkpoint = super().get_experiment_checkpoint()
+        if self.model_family != "rmt":
+            return checkpoint
+
+        checkpoint["rmt_memory"] = None if self.rmt_memory is None else self.rmt_memory.detach().cpu()
+        checkpoint["rmt_global_step"] = self.rmt_global_step
+        checkpoint["rmt_optimizer_step_count"] = self.rmt_optimizer_step_count
+        checkpoint["rmt_running_memory_norm"] = self.rmt_running_memory_norm.detach().cpu()
+        checkpoint["rmt_running_memory_update_norm"] = self.rmt_running_memory_update_norm.detach().cpu()
+        return checkpoint
+
+    def load_checkpoint_data_and_update_experiment_variables(self, file_path):
+        super().load_checkpoint_data_and_update_experiment_variables(file_path)
+        if self.model_family != "rmt":
+            return
+
+        with open(file_path, mode="rb") as experiment_checkpoint_file:
+            checkpoint = pickle.load(experiment_checkpoint_file)
+
+        rmt_memory = checkpoint.get("rmt_memory", None)
+        if rmt_memory is not None:
+            requires_grad = self.rmt_variant == "fast_memory"
+            self.rmt_memory = rmt_memory.to(self.device).detach().requires_grad_(requires_grad)
+        else:
+            self.rmt_memory = None
+
+        self.rmt_global_step = checkpoint.get("rmt_global_step", 0)
+        self.rmt_optimizer_step_count = checkpoint.get("rmt_optimizer_step_count", 0)
+        self.rmt_running_memory_norm = checkpoint.get(
+            "rmt_running_memory_norm", torch.tensor(0.0, dtype=torch.float32)
+        ).to(self.device)
+        self.rmt_running_memory_update_norm = checkpoint.get(
+            "rmt_running_memory_update_norm", torch.tensor(0.0, dtype=torch.float32)
+        ).to(self.device)
+
+    @torch.no_grad()
+    def _evaluate_rmt_network(self, data_loader: DataLoader, memory_tokens: torch.Tensor):
+        avg_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        avg_acc = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        num_batches = 0
+        active_classes = self.all_classes[:self.current_num_classes]
+
+        frozen_memory = memory_tokens.detach()
+        for sample in data_loader:
+            images = sample["image"].to(self.device)
+            labels = sample["label"].to(self.device)
+            preds = self.net.forward(images, frozen_memory)[:, active_classes]
+            avg_loss += self.loss(preds, labels)
+            avg_acc += compute_accuracy_from_batch(preds, labels)
+            num_batches += 1
+
+        return avg_loss / num_batches, avg_acc / num_batches
+
+    def _store_test_summaries(self, test_data: DataLoader, val_data: DataLoader, epoch_number: int,
+                              epoch_runtime: float):
+        if self.model_family == "vit":
+            super()._store_test_summaries(test_data, val_data, epoch_number, epoch_runtime)
+            return
+
+        self.results_dict["epoch_runtime"][epoch_number] += torch.tensor(epoch_runtime, dtype=torch.float32)
+        eval_memory = self.rmt_memory.detach().clone() if self.rmt_memory is not None else self._initialize_rmt_memory(False)
+
+        self.net.eval()
+        for data_name, data_loader, compare_to_best in [("test", test_data, False), ("validation", val_data, True)]:
+            evaluation_start_time = time.perf_counter()
+            loss, accuracy = self._evaluate_rmt_network(data_loader, eval_memory)
+            evaluation_time = time.perf_counter() - evaluation_start_time
+
+            if compare_to_best:
+                if accuracy > self.best_accuracy:
+                    self.best_accuracy = accuracy
+                    if not self.compare_loss:
+                        self.best_model_parameters = deepcopy(self.net.state_dict())
+                if loss < self.best_loss:
+                    self.best_loss = loss
+                    if self.compare_loss:
+                        self.best_model_parameters = deepcopy(self.net.state_dict())
+
+            self.results_dict[data_name + "_evaluation_runtime"][epoch_number] += torch.tensor(evaluation_time, dtype=torch.float32)
+            self.results_dict[data_name + "_loss_per_epoch"][epoch_number] += loss
+            self.results_dict[data_name + "_accuracy_per_epoch"][epoch_number] += accuracy
+            self._print(f"\t{data_name} accuracy: {accuracy:.4f}")
+
+        self.net.train()
+
     def run(self):
-        # load data
         training_data, training_dl = get_cifar_data(self.data_path, train=True, validation=False,
                                                     batch_size=self.batch_sizes["train"], num_workers=self.num_workers)
         val_data, val_dl = get_cifar_data(self.data_path, train=True, validation=True,
                                           batch_size=self.batch_sizes["validation"], num_workers=self.num_workers)
         test_data, test_dl = get_cifar_data(self.data_path, train=False, batch_size=self.batch_sizes["test"],
                                             num_workers=self.num_workers)
-        # load checkpoint if available
         self.load_experiment_checkpoint()
-        # train network
         self.train(train_dataloader=training_dl, test_dataloader=test_dl, val_dataloader=val_dl,
                    test_data=test_data, training_data=training_data, val_data=val_data)
-
         self.post_process_results()
-        # if using mlproj_manager, summaries are stored in memory by calling exp.store_results()
 
     def train(self, train_dataloader: DataLoader, test_dataloader: DataLoader, val_dataloader: DataLoader,
               test_data: CifarDataSet, training_data: CifarDataSet, val_data: CifarDataSet):
-
-        # partition data
         training_data.select_new_partition(self.all_classes[:self.current_num_classes])
         test_data.select_new_partition(self.all_classes[:self.current_num_classes])
         val_data.select_new_partition(self.all_classes[:self.current_num_classes])
 
-        # get lr scheduler and save model parameters
         if self.use_lr_schedule:
-            self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=len(train_dataloader))
+            if self.model_family == "rmt":
+                effective_steps = int(np.ceil(len(train_dataloader) / self.rmt_slow_update_freq))
+                self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=max(1, effective_steps))
+            else:
+                self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=len(train_dataloader))
         save_model_parameters(self.results_dir, self.run_index, self.current_epoch, self.net)
 
-        # start training
         for e in range(self.current_epoch, self.num_epochs):
             self._print(f"Epoch: {e + 1}")
 
             epoch_start = time.perf_counter()
-            for step_number, sample in enumerate(tqdm(train_dataloader)):
-                # sample observationa and target
-                image = sample["image"].to(self.device)
-                label = sample["label"].to(self.device)
-
-                # reset gradients
-                for param in self.net.parameters(): param.grad = None   # apparently faster than optim.zero_grad()
-
-                # compute prediction and loss
-                predictions = self.net.forward(image)[:, self.all_classes[:self.current_num_classes]]
-                current_loss = self.loss(predictions, label)
-                detached_loss = current_loss.detach().clone()
-
-                # backpropagate and update weights
-                current_loss.backward()
-                self.optim.step()
-                if self.use_lr_schedule:
-                    self.lr_scheduler.step()
-                    if self.lr_scheduler.get_last_lr()[0] > 0.0 and not self.rescaled_wd:
-                        self.optim.param_groups[0]['weight_decay'] = self.weight_decay / self.lr_scheduler.get_last_lr()[0]
-                # use swr
-                if self.swr_optim is not None:
-                    self.swr_optim.step()
-                    self.store_num_replaced()
-                # use shrink and perturb (shrink part is done by the optimizer)
-                if self.use_parameter_noise: perturb_weights(self.net, self.parameter_noise_var)
-
-                # store summaries
-                current_accuracy = compute_accuracy_from_batch(predictions, label)
-                self.running_loss += detached_loss
-                self.running_accuracy += current_accuracy.detach()
-                if (step_number + 1) % self.running_avg_window == 0:
-                    # self._print("\t\tStep Number: {0}".format(step_number + 1))
-                    self._store_training_summaries()
-
-                self.current_minibatch += 1
-
+            if self.model_family == "vit":
+                self._train_vit(train_dataloader)
+            else:
+                self._train_rmt(train_dataloader)
             epoch_end = time.perf_counter()
 
             self._store_test_summaries(test_dataloader, val_dataloader, epoch_number=e, epoch_runtime=epoch_end - epoch_start)
@@ -257,18 +402,130 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             if self.current_epoch % self.checkpoint_save_frequency == 0:
                 self.save_experiment_checkpoint()
 
+    def _train_vit(self, train_dataloader: DataLoader):
+        for step_number, sample in enumerate(tqdm(train_dataloader)):
+            image = sample["image"].to(self.device)
+            label = sample["label"].to(self.device)
+
+            for param in self.net.parameters():
+                param.grad = None
+
+            predictions = self.net.forward(image)[:, self.all_classes[:self.current_num_classes]]
+            current_loss = self.loss(predictions, label)
+            detached_loss = current_loss.detach().clone()
+
+            current_loss.backward()
+            self.optim.step()
+            if self.use_lr_schedule:
+                self.lr_scheduler.step()
+                if self.lr_scheduler.get_last_lr()[0] > 0.0 and not self.rescaled_wd:
+                    self.optim.param_groups[0]["weight_decay"] = self.weight_decay / self.lr_scheduler.get_last_lr()[0]
+            if self.swr_optim is not None:
+                self.swr_optim.step()
+                self.store_num_replaced()
+            if self.use_parameter_noise:
+                perturb_weights(self.net, self.parameter_noise_var)
+
+            current_accuracy = compute_accuracy_from_batch(predictions, label)
+            self.running_loss += detached_loss
+            self.running_accuracy += current_accuracy.detach()
+            if (step_number + 1) % self.running_avg_window == 0:
+                self._store_training_summaries()
+
+            self.current_minibatch += 1
+
+    def _train_rmt(self, train_dataloader: DataLoader):
+        if self.rmt_memory is None:
+            self.rmt_memory = self._initialize_rmt_memory()
+
+        active_classes = self.all_classes[:self.current_num_classes]
+        self.optim.zero_grad(set_to_none=True)
+        for step_number, sample in enumerate(tqdm(train_dataloader)):
+            image = sample["image"].to(self.device)
+            label = sample["label"].to(self.device)
+
+            if self.rmt_variant == "baseline":
+                predictions, encoded_memory = self.net.forward(image, self.rmt_memory, return_encoded_memory=True)
+                predictions = predictions[:, active_classes]
+                current_loss = self.loss(predictions, label)
+                detached_loss = current_loss.detach().clone()
+                current_loss.backward()
+
+                with torch.no_grad():
+                    next_memory = encoded_memory.detach().mean(dim=0)
+                    memory_update_norm = (next_memory - self.rmt_memory.detach()).norm()
+                    self.rmt_memory = next_memory
+            else:
+                if not self.rmt_memory.requires_grad:
+                    self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
+
+                predictions = self.net.forward(image, self.rmt_memory)[:, active_classes]
+                current_loss = self.loss(predictions, label)
+                detached_loss = current_loss.detach().clone()
+                current_loss.backward()
+
+                memory_update_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                with torch.no_grad():
+                    if self.rmt_memory.grad is not None:
+                        if self.rmt_clip_memory_grad is not None:
+                            grad_norm = self.rmt_memory.grad.norm()
+                            if grad_norm > self.rmt_clip_memory_grad:
+                                scaling = self.rmt_clip_memory_grad / (grad_norm + 1e-12)
+                                self.rmt_memory.grad.mul_(scaling)
+                        memory_step = self.rmt_fast_lr * self.rmt_memory.grad
+                        self.rmt_memory -= memory_step
+                        memory_update_norm = memory_step.norm()
+                self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
+
+            # Slow updates must be scheduled in epoch-local coordinates so the
+            # optimizer/scheduler step counts match steps_per_epoch exactly.
+            do_slow_step = ((step_number + 1) % self.rmt_slow_update_freq) == 0
+            if do_slow_step:
+                self.optim.step()
+                self.rmt_optimizer_step_count += 1
+                if self.use_lr_schedule:
+                    self.lr_scheduler.step()
+                    if self.lr_scheduler.get_last_lr()[0] > 0.0 and not self.rescaled_wd:
+                        self.optim.param_groups[0]["weight_decay"] = self.weight_decay / self.lr_scheduler.get_last_lr()[0]
+                if self.use_parameter_noise:
+                    perturb_weights(self.net, self.parameter_noise_var)
+                self.optim.zero_grad(set_to_none=True)
+
+            current_accuracy = compute_accuracy_from_batch(predictions, label)
+            self.running_loss += detached_loss
+            self.running_accuracy += current_accuracy.detach()
+            self._store_rmt_extended_summaries(memory_norm=self.rmt_memory.detach().norm(), memory_update_norm=memory_update_norm)
+            if (step_number + 1) % self.running_avg_window == 0:
+                self._store_training_summaries()
+
+            self.current_minibatch += 1
+            self.rmt_global_step += 1
+
+        # Flush trailing accumulated gradients when the number of batches is not divisible by the slow update frequency.
+        has_pending_grads = any(p.grad is not None for p in self.net.parameters())
+        if has_pending_grads:
+            self.optim.step()
+            self.rmt_optimizer_step_count += 1
+            if self.use_lr_schedule:
+                self.lr_scheduler.step()
+                if self.lr_scheduler.get_last_lr()[0] > 0.0 and not self.rescaled_wd:
+                    self.optim.param_groups[0]["weight_decay"] = self.weight_decay / self.lr_scheduler.get_last_lr()[0]
+            if self.use_parameter_noise:
+                perturb_weights(self.net, self.parameter_noise_var)
+            self.optim.zero_grad(set_to_none=True)
+
     def get_lr_scheduler(self, steps_per_epoch: int):
         scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optim, max_lr=self.stepsize, anneal_strategy="linear",
                                                         epochs=self.class_increase_frequency,
                                                         steps_per_epoch=steps_per_epoch)
         if not self.rescaled_wd:
-            self.optim.param_groups[0]['weight_decay'] = self.weight_decay / scheduler.get_last_lr()[0]
+            self.optim.param_groups[0]["weight_decay"] = self.weight_decay / scheduler.get_last_lr()[0]
         return scheduler
 
     def extend_classes(self, training_data: CifarDataSet, test_data: CifarDataSet, val_data: CifarDataSet,
                        train_dataloader: DataLoader):
         """
-        Adds 5 new classes to the data set with certain frequency
+        Adds new classes to the data set with the configured frequency.
         """
         if (self.current_epoch % self.class_increase_frequency) == 0 and (not self.fixed_classes):
             self._print("Best accuracy in the task: {0:.4f}".format(self.best_accuracy))
@@ -279,7 +536,8 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             self.best_model_parameters = {}
             save_model_parameters(self.results_dir, self.run_index, self.current_epoch, self.net)
 
-            if self.current_num_classes == self.num_classes: return
+            if self.current_num_classes == self.num_classes:
+                return
 
             self.current_num_classes += self.class_increase
             training_data.select_new_partition(self.all_classes[:self.current_num_classes])
@@ -288,9 +546,18 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
             self._print("\tNew class added...")
             if self.reset_head:
-                initialize_vit_heads(self.net.heads)
+                if self.model_family == "vit":
+                    initialize_vit_heads(self.net.heads)
+                else:
+                    torch.nn.init.zeros_(self.net.head.weight)
+                    torch.nn.init.zeros_(self.net.head.bias)
             if self.reset_network:
-                initialize_vit(self.net)
+                if self.model_family == "vit":
+                    initialize_vit(self.net)
+                else:
+                    initialize_memory_vit(self.net)
+                    if self.rmt_memory_reset_at_task_boundary:
+                        self.rmt_memory = self._initialize_rmt_memory()
                 self.optim = self._get_optimizer()
             if self.reset_layer_norm:
                 self.net.apply(initialize_layer_norm_module)
@@ -301,7 +568,13 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             if self.reset_momentum:
                 self.optim = self._get_optimizer()
             if self.use_lr_schedule:
-                self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=len(train_dataloader))
+                if self.model_family == "rmt":
+                    effective_steps = int(np.ceil(len(train_dataloader) / self.rmt_slow_update_freq))
+                    self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=max(1, effective_steps))
+                else:
+                    self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=len(train_dataloader))
+            if self.model_family == "rmt" and self.rmt_memory_reset_at_task_boundary:
+                self.rmt_memory = self._initialize_rmt_memory()
             return True
         return False
 

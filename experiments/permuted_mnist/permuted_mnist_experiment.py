@@ -11,10 +11,9 @@ from tqdm import tqdm
 # from ml project manager
 from mlproj_manager.problems import MnistDataSet
 from mlproj_manager.util import access_dict, Permute, turn_off_debugging_processes
-from mlproj_manager.util.neural_networks import init_weights_kaiming
 
 # from src
-from src.networks import ThreeHiddenLayerNetwork, init_three_hidden_layer_network_weights, perturb_weights
+from src.networks import MemoryTransformer, ThreeHiddenLayerNetwork, init_three_hidden_layer_network_weights, perturb_weights
 from src.utils.experiment_utils import parse_terminal_arguments
 from src.utils.evaluation_functions import compute_average_gradient_magnitude, set_random_seed
 from src.utils.permuted_mnist_experiment_utils import PermutedMNISTExperimentBase
@@ -24,7 +23,7 @@ from src.optimizers import SGDW
 
 class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
 
-    def __init__(self, exp_params: dict, results_dir: str, run_index: int, verbose=False):
+    def __init__(self, exp_params: dict, results_dir: str, run_index: int, verbose=False, gpu_index: int = 0):
         super().__init__(exp_params, results_dir, run_index, verbose=verbose)
 
         # set debugging options for pytorch
@@ -32,13 +31,15 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
         turn_off_debugging_processes(debug)
 
         # define torch device
-        self.device = torch.device("cpu")
+        gpu_index = access_dict(exp_params, "gpu_index", default=gpu_index, val_type=int)
+        self.device = torch.device(f"cuda:{gpu_index}" if torch.cuda.is_available() else "cpu")
 
         """ For reproducibility """
         set_random_seed(self.run_index)
 
         """ Experiment parameters """
         self.extended_summaries = access_dict(exp_params, "extended_summaries", default=False, val_type=bool)
+        self.model_family = access_dict(exp_params, "model_family", default="mlp", val_type=str, choices=["mlp", "rmt"])
         # learning parameters
         self.stepsize = exp_params["stepsize"]
         self.l2_factor = access_dict(exp_params, "l2_factor", default=0.0, val_type=float)
@@ -47,7 +48,7 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
         self.beta2 = access_dict(exp_params, "beta2", default=None, val_type=float)
 
         """ Architecture parameters """
-        self.num_hidden = exp_params["num_hidden"]      # number of hidden units per hidden layer
+        self.num_hidden = exp_params["num_hidden"] if self.model_family == "mlp" else access_dict(exp_params, "num_hidden", default=100, val_type=int)
         self.activation_function = access_dict(exp_params, "activation_function", default="relu", val_type=str,
                                                choices=["relu", "sigmoid", "tanh", "leaky_relu", "gelu", "silu"])
         self.use_crelu = access_dict(exp_params, "use_crelu", default=False, val_type=bool)
@@ -62,9 +63,30 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
 
         # problem parameters
         self.num_permutations = exp_params["num_permutations"]      # 1 permutation = 1 epoch
-        self.batch_size = 30
+        self.batch_size = access_dict(exp_params, "batch_size", default=30, val_type=int)
         self.steps_per_task = 60000
         self.current_experiment_step = 0
+
+        # RMT parameters
+        self.rmt_variant = access_dict(exp_params, "rmt_variant", default="fast_memory", val_type=str,
+                                       choices=["baseline", "fast_memory"])
+        self.rmt_patch_size = access_dict(exp_params, "rmt_patch_size", default=4, val_type=int)
+        self.rmt_d_model = access_dict(exp_params, "rmt_d_model", default=64, val_type=int)
+        self.rmt_n_layers = access_dict(exp_params, "rmt_n_layers", default=2, val_type=int)
+        self.rmt_n_heads = access_dict(exp_params, "rmt_n_heads", default=4, val_type=int)
+        self.rmt_mlp_ratio = access_dict(exp_params, "rmt_mlp_ratio", default=2.0, val_type=float)
+        self.rmt_n_mem = access_dict(exp_params, "rmt_n_mem", default=2, val_type=int)
+        self.rmt_fast_lr = access_dict(exp_params, "rmt_fast_lr", default=0.1, val_type=float)
+        self.rmt_slow_update_freq = access_dict(exp_params, "rmt_slow_update_freq", default=10, val_type=int)
+        self.rmt_memory_reset_at_task_boundary = access_dict(exp_params, "rmt_memory_reset_at_task_boundary", default=True, val_type=bool)
+        self.rmt_clip_memory_grad = access_dict(exp_params, "rmt_clip_memory_grad", default=None, val_type=float)
+        if self.rmt_slow_update_freq <= 0:
+            raise ValueError("rmt_slow_update_freq must be >= 1.")
+        self.rmt_memory = None
+        self.rmt_global_step = 0
+        self.rmt_optimizer_step_count = 0
+        self.rmt_running_memory_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        self.rmt_running_memory_update_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
         """ Reinitialization parameters """
         # SWR parameters
@@ -87,6 +109,11 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
         self.use_redo = (self.redo_reinit_freq is not None) and (self.redo_reinit_threshold is not None) and (self.redo_utility is not None)
         # for both cbp and redo
         self.reinit_after_ln = access_dict(exp_params, "reinit_after_ln", default=False, val_type=bool)
+        if self.model_family == "rmt":
+            # Explicitly disable CBP/ReDo/SWR for RMT runs.
+            self.use_swr = False
+            self.use_cbp = False
+            self.use_redo = False
         # Shrink and Perturb parameters
         self.parameter_noise_var = access_dict(exp_params, "parameter_noise_var", default=0.0, val_type=float)
         self.use_parameter_noise = self.parameter_noise_var > 0.0
@@ -100,23 +127,7 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
         self.num_inputs = 784
 
         """ Network set up """
-        self.net = ThreeHiddenLayerNetwork(hidden_dim=self.num_hidden,
-                                           activation_function=self.activation_function,
-                                           use_skip_connections=self.use_skip_connections,
-                                           preactivation_skip_connection=self.preactivation_skip_connections,
-                                           use_cbp=self.use_cbp,
-                                           maturity_threshold=self.maturity_threshold,
-                                           replacement_rate=self.replacement_rate,
-                                           cbp_utility=self.cbp_utility,
-                                           use_redo=self.use_redo,
-                                           reinit_frequency=self.redo_reinit_freq,
-                                           reinit_threshold=self.redo_reinit_threshold,
-                                           redo_utility=self.redo_utility,
-                                           use_layer_norm=self.use_ln,
-                                           preactivation_layer_norm=self.preactivation_ln,
-                                           reinit_after_ln=self.reinit_after_ln,
-                                           use_crelu=self.use_crelu)
-        self.net.apply(lambda z: init_three_hidden_layer_network_weights(z, nonlinearity=self.activation_function))     # initialize weights
+        self.net = self._build_mlp_model() if self.model_family == "mlp" else self._build_rmt_model()
         self.net.to(self.device)
         # initialize selective weight reinitialization
         self.swr_optim = None
@@ -143,6 +154,110 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
         self.running_avg_grad_magnitude = 0.0
         self.previous_activations = []
         self.results_dict = self.initialize_results_dict()
+        self._initialize_rmt_summaries_if_needed()
+
+    def _build_mlp_model(self):
+        net = ThreeHiddenLayerNetwork(hidden_dim=self.num_hidden,
+                                      activation_function=self.activation_function,
+                                      use_skip_connections=self.use_skip_connections,
+                                      preactivation_skip_connection=self.preactivation_skip_connections,
+                                      use_cbp=self.use_cbp,
+                                      maturity_threshold=self.maturity_threshold,
+                                      replacement_rate=self.replacement_rate,
+                                      cbp_utility=self.cbp_utility,
+                                      use_redo=self.use_redo,
+                                      reinit_frequency=self.redo_reinit_freq,
+                                      reinit_threshold=self.redo_reinit_threshold,
+                                      redo_utility=self.redo_utility,
+                                      use_layer_norm=self.use_ln,
+                                      preactivation_layer_norm=self.preactivation_ln,
+                                      reinit_after_ln=self.reinit_after_ln,
+                                      use_crelu=self.use_crelu)
+        net.apply(lambda z: init_three_hidden_layer_network_weights(z, nonlinearity=self.activation_function))
+        return net
+
+    def _build_rmt_model(self):
+        return MemoryTransformer(
+            patch_size=self.rmt_patch_size,
+            d_model=self.rmt_d_model,
+            n_layers=self.rmt_n_layers,
+            n_heads=self.rmt_n_heads,
+            mlp_ratio=self.rmt_mlp_ratio,
+            n_mem=self.rmt_n_mem,
+            num_classes=self.num_classes,
+            img_size=28,
+        )
+
+    def _initialize_rmt_summaries_if_needed(self):
+        if self.model_family != "rmt" or not self.extended_summaries:
+            return
+        defaults = {"device": self.device, "dtype": torch.float32}
+        total_ckpts = self.results_dict["train_loss_per_checkpoint"].shape[0]
+        self.results_dict["rmt_memory_norm_per_checkpoint"] = torch.zeros(total_ckpts, **defaults)
+        self.results_dict["rmt_memory_update_norm_per_checkpoint"] = torch.zeros(total_ckpts, **defaults)
+
+    def _initialize_rmt_memory(self):
+        memory = torch.zeros(self.rmt_n_mem, self.rmt_d_model, device=self.device, dtype=torch.float32)
+        if self.rmt_variant == "fast_memory":
+            memory.requires_grad_(True)
+        return memory
+
+    def _prepare_rmt_images(self, image: torch.Tensor) -> torch.Tensor:
+        image = image.to(self.device)
+        if image.ndim == 2:
+            if image.shape[1] != self.num_inputs:
+                raise ValueError(f"Expected image shape (B, {self.num_inputs}), got {tuple(image.shape)}")
+            image = image.reshape(image.shape[0], 1, 28, 28)
+        elif image.ndim == 3:
+            if image.shape[1:] != (28, 28):
+                raise ValueError(f"Expected image shape (B, 28, 28), got {tuple(image.shape)}")
+            image = image.unsqueeze(1)
+        elif image.ndim == 4:
+            if image.shape[1:] == (1, 28, 28):
+                pass
+            elif image.shape[1:] == (28, 28, 1):
+                image = image.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(f"Expected image shape (B, 1, 28, 28) or (B, 28, 28, 1), got {tuple(image.shape)}")
+        else:
+            raise ValueError(f"Unsupported image shape: {tuple(image.shape)}")
+        return image.to(torch.float32)
+
+    def _prepare_rmt_labels(self, label: torch.Tensor) -> torch.Tensor:
+        label = label.to(self.device)
+        if label.ndim == 1:
+            return label.to(torch.long)
+        if label.ndim == 2:
+            return label.argmax(dim=1).to(torch.long)
+        raise ValueError(f"Unsupported label shape: {tuple(label.shape)}")
+
+    def _store_rmt_extended_summaries(self, memory_norm: torch.Tensor, memory_update_norm: torch.Tensor):
+        if not self.extended_summaries:
+            return
+        self.running_avg_grad_magnitude += compute_average_gradient_magnitude(self.net)
+        self.rmt_running_memory_norm += memory_norm.detach()
+        self.rmt_running_memory_update_norm += memory_update_norm.detach()
+
+    def _store_training_summaries(self):
+        super()._store_training_summaries()
+        if self.model_family == "rmt" and self.extended_summaries:
+            idx = self.current_running_avg_step - 1
+            self.results_dict["rmt_memory_norm_per_checkpoint"][idx] += self.rmt_running_memory_norm / self.running_avg_window
+            self.results_dict["rmt_memory_update_norm_per_checkpoint"][idx] += self.rmt_running_memory_update_norm / self.running_avg_window
+            self.rmt_running_memory_norm *= 0.0
+            self.rmt_running_memory_update_norm *= 0.0
+
+    def _move_results_to_cpu(self):
+        """
+        Ensure all torch tensors in results are CPU tensors so numpy conversion/storage is safe.
+        """
+        for key, value in self.results_dict.items():
+            if isinstance(value, torch.Tensor):
+                self.results_dict[key] = value.detach().cpu()
+            elif isinstance(value, list):
+                contains_tensor = any(isinstance(v, torch.Tensor) for v in value)
+                if contains_tensor:
+                    self.results_dict[key] = [v.detach().cpu() if isinstance(v, torch.Tensor) else v for v in value]
 
     def get_optimizer(self):
         if self.use_adamw:
@@ -161,12 +276,19 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
         # train network
         self.train(mnist_data_loader=mnist_data_loader, training_data=mnist_train_data)
         self.post_process_extended_results()
-        print(np.average(self.results_dict["train_accuracy_per_checkpoint"]))
+        self._move_results_to_cpu()
+        print(float(self.results_dict["train_accuracy_per_checkpoint"].mean()))
 
     def train(self, mnist_data_loader: DataLoader, training_data: MnistDataSet):
+        if self.model_family == "rmt":
+            self._train_rmt(mnist_data_loader=mnist_data_loader, training_data=training_data)
+        else:
+            self._train_mlp(mnist_data_loader=mnist_data_loader, training_data=training_data)
 
+    def _train_mlp(self, mnist_data_loader: DataLoader, training_data: MnistDataSet):
         for _ in tqdm(range(self.num_permutations), disable=not self.verbose):
-            if self.current_permutation == self.num_permutations: break
+            if self.current_permutation == self.num_permutations:
+                break
             training_data.set_transformation(Permute(np.random.permutation(self.num_inputs)))  # apply new permutation
 
             # compute percent of dead units, stable rank, and average weight magnitude
@@ -181,7 +303,8 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
                 label = sample["label"]
 
                 # reset gradients
-                for param in self.net.parameters(): param.grad = None  # apparently faster than optim.zero_grad()
+                for param in self.net.parameters():
+                    param.grad = None  # apparently faster than optim.zero_grad()
 
                 # compute prediction and loss
                 current_activations = [] if (self.extended_summaries and self.use_ln and (self.use_cbp or self.use_swr or self.use_redo)) else None
@@ -192,8 +315,10 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
                 # backpropagate, update weights, use swr, and perturb weights
                 current_loss.backward()
                 self.optim.step()
-                if self.swr_optim is not None: self.swr_optim.step()
-                if self.use_parameter_noise: perturb_weights(self.net, self.parameter_noise_var)
+                if self.swr_optim is not None:
+                    self.swr_optim.step()
+                if self.use_parameter_noise:
+                    perturb_weights(self.net, self.parameter_noise_var)
 
                 # store extended summaries
                 if self.extended_summaries:
@@ -206,6 +331,77 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
                 self.running_accuracy += current_accuracy.detach()
                 if (i + 1) % self.running_avg_window == 0:
                     self._store_training_summaries()
+
+            self.current_permutation += 1
+
+    def _train_rmt(self, mnist_data_loader: DataLoader, training_data: MnistDataSet):
+        self.rmt_memory = self._initialize_rmt_memory()
+
+        for _ in tqdm(range(self.num_permutations), disable=not self.verbose):
+            if self.current_permutation == self.num_permutations:
+                break
+            training_data.set_transformation(Permute(np.random.permutation(self.num_inputs)))
+
+            if self.rmt_memory_reset_at_task_boundary:
+                self.rmt_memory = self._initialize_rmt_memory()
+            elif self.rmt_variant == "fast_memory" and not self.rmt_memory.requires_grad:
+                self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
+
+            for i, sample in enumerate(mnist_data_loader):
+                self.current_experiment_step += 1
+
+                image = self._prepare_rmt_images(sample["image"])
+                label = self._prepare_rmt_labels(sample["label"])
+                self.optim.zero_grad(set_to_none=True)
+
+                if self.rmt_variant == "baseline":
+                    predictions, encoded_memory = self.net.forward(image, self.rmt_memory, return_encoded_memory=True)
+                    current_loss = self.loss(predictions, label)
+                    detached_loss = current_loss.detach().clone()
+                    current_loss.backward()
+
+                    with torch.no_grad():
+                        next_memory = encoded_memory.detach().mean(dim=0)
+                        memory_update_norm = (next_memory - self.rmt_memory.detach()).norm()
+                        self.rmt_memory = next_memory
+
+                else:   # fast_memory
+                    if not self.rmt_memory.requires_grad:
+                        self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
+
+                    predictions = self.net.forward(image, self.rmt_memory)
+                    current_loss = self.loss(predictions, label)
+                    detached_loss = current_loss.detach().clone()
+                    current_loss.backward()
+
+                    memory_update_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                    with torch.no_grad():
+                        if self.rmt_memory.grad is not None:
+                            if self.rmt_clip_memory_grad is not None:
+                                grad_norm = self.rmt_memory.grad.norm()
+                                if grad_norm > self.rmt_clip_memory_grad:
+                                    scaling = self.rmt_clip_memory_grad / (grad_norm + 1e-12)
+                                    self.rmt_memory.grad.mul_(scaling)
+                            memory_step = self.rmt_fast_lr * self.rmt_memory.grad
+                            self.rmt_memory -= memory_step
+                            memory_update_norm = memory_step.norm()
+                    self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
+
+                if (self.rmt_global_step % self.rmt_slow_update_freq) == 0:
+                    self.optim.step()
+                    self.rmt_optimizer_step_count += 1
+                    if self.use_parameter_noise:
+                        perturb_weights(self.net, self.parameter_noise_var)
+
+                current_accuracy = torch.mean((predictions.argmax(axis=1) == label).to(torch.float32))
+                self.running_loss += detached_loss
+                self.running_accuracy += current_accuracy.detach()
+                self._store_rmt_extended_summaries(memory_norm=self.rmt_memory.detach().norm(), memory_update_norm=memory_update_norm)
+
+                if (i + 1) % self.running_avg_window == 0:
+                    self._store_training_summaries()
+
+                self.rmt_global_step += 1
 
             self.current_permutation += 1
 
@@ -233,7 +429,8 @@ def main():
     exp = PermutedMNISTExperiment(experiment_parameters,
                                   results_dir=os.path.join(results_path, results_dir_name),
                                   run_index=terminal_arguments.run_index,
-                                  verbose=terminal_arguments.verbose)
+                                  verbose=terminal_arguments.verbose,
+                                  gpu_index=terminal_arguments.gpu_index)
     exp.run()
     exp.store_results()
     final_time = time.perf_counter()

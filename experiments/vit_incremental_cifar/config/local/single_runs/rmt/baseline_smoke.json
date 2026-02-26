@@ -1,0 +1,44 @@
+{
+  "__comment_1__": "Quick smoke run for RMT baseline memory carry.",
+  "stepsize": 0.01,
+  "weight_decay": 6e-6,
+  "dropout_prob": 0.1,
+  "reparam_ln": false,
+  "use_lr_schedule": true,
+  "rescaled_wd": false,
+  "momentum": 0.9,
+
+  "__comment_2__": "Short incremental schedule for validation.",
+  "num_epochs": 20,
+  "initial_num_classes": 5,
+  "fixed_classes": false,
+  "class_increase": 5,
+  "class_increase_frequency": 5,
+  "use_best_network": true,
+
+  "__comment_3__": "RMT settings.",
+  "model_family": "rmt",
+  "rmt_variant": "baseline",
+  "rmt_patch_size": 4,
+  "rmt_d_model": 384,
+  "rmt_n_layers": 8,
+  "rmt_n_heads": 12,
+  "rmt_mlp_ratio": 4.0,
+  "rmt_n_mem": 2,
+  "rmt_fast_lr": 0.1,
+  "rmt_slow_update_freq": 10,
+  "rmt_memory_reset_at_task_boundary": true,
+  "rmt_clip_memory_grad": null,
+
+  "__comment_4__": "Diagnostics.",
+  "extended_summaries": true,
+  "parameter_noise_var": 0.0,
+
+  "__comment_5__": "Result folder naming.",
+  "relevant_parameters": [
+    "model_family",
+    "rmt_variant",
+    "num_epochs",
+    "class_increase_frequency"
+  ]
+}
