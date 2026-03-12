@@ -12,6 +12,7 @@
   "num_permutations": 1000,
   "batch_size": 30,
   "extended_summaries": true,
+  "log_rmt_minibatch_losses": true,
 
   "__comment_3__": "RMT architecture and update parameters.",
   "rmt_patch_size": 4,

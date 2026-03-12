@@ -88,6 +88,7 @@ class PermutedMNISTExperimentBase(Experiment):
 
     def __init__(self, exp_params: dict, results_dir: str, run_index: int, verbose=False):
         super().__init__(exp_params, results_dir, run_index, verbose)
+        self.tb_logger = None
 
         self.device = torch.device("cpu")
         self.compute_average_weight_magnitude = 0
@@ -159,14 +160,24 @@ class PermutedMNISTExperimentBase(Experiment):
 
     def _store_training_summaries(self):
         # store train data for checkpoints
-        self.results_dict["train_loss_per_checkpoint"][self.current_running_avg_step] += self.running_loss / self.running_avg_window
-        self.results_dict["train_accuracy_per_checkpoint"][self.current_running_avg_step] += self.running_accuracy / self.running_avg_window
+        checkpoint_step = self.current_running_avg_step
+        avg_loss = self.running_loss / self.running_avg_window
+        avg_acc = self.running_accuracy / self.running_avg_window
+        self.results_dict["train_loss_per_checkpoint"][checkpoint_step] += avg_loss
+        self.results_dict["train_accuracy_per_checkpoint"][checkpoint_step] += avg_acc
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("train/loss_per_checkpoint", avg_loss, checkpoint_step)
+            self.tb_logger.log_scalar("train/accuracy_per_checkpoint", avg_acc, checkpoint_step)
         self.running_loss *= 0.0
         self.running_accuracy *= 0.0
 
         if self.extended_summaries:
-            self.results_dict["average_gradient_magnitude_per_checkpoint"][self.current_running_avg_step] += \
-                self.running_avg_grad_magnitude / self.running_avg_window
+            avg_grad_magnitude = self.running_avg_grad_magnitude / self.running_avg_window
+            self.results_dict["average_gradient_magnitude_per_checkpoint"][checkpoint_step] += avg_grad_magnitude
+            if self.tb_logger is not None:
+                self.tb_logger.log_scalar("train/average_gradient_magnitude_per_checkpoint",
+                                          avg_grad_magnitude,
+                                          checkpoint_step)
             self.running_avg_grad_magnitude *= 0.0
 
         self.current_running_avg_step += 1
@@ -181,16 +192,25 @@ class PermutedMNISTExperimentBase(Experiment):
     def compute_network_extended_summaries(self, training_data: DataLoader):
         """ Computes the average weight magnitude, proportion of dead units, and stable rank of the representation """
         if not self.extended_summaries: return
+        permutation_step = self.current_permutation
         avg_weight_magnitude, avg_ln_weight_magnitude = compute_average_weight_magnitude(self.net)
         prop_dead_units, stable_rank = compute_dead_units_prop_and_stable_rank(self.net, training_data, self.num_hidden,
                                                                                self.batch_size,
                                                                                activation_function=self.activation_function,
                                                                                epsilon=0.01)
-        self.results_dict["average_weight_magnitude_per_permutation"][self.current_permutation] += avg_weight_magnitude
-        self.results_dict["stable_rank_per_permutation"][self.current_permutation] += stable_rank
-        self.results_dict["proportion_dead_units_per_permutation"][self.current_permutation] += prop_dead_units
+        self.results_dict["average_weight_magnitude_per_permutation"][permutation_step] += avg_weight_magnitude
+        self.results_dict["stable_rank_per_permutation"][permutation_step] += stable_rank
+        self.results_dict["proportion_dead_units_per_permutation"][permutation_step] += prop_dead_units
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("permutation/average_weight_magnitude", avg_weight_magnitude, permutation_step)
+            self.tb_logger.log_scalar("permutation/proportion_dead_units", prop_dead_units, permutation_step)
+            self.tb_logger.log_scalar("permutation/stable_rank", stable_rank, permutation_step)
         if self.use_ln:
-            self.results_dict["average_ln_weight_magnitude_per_checkpoint"][self.current_permutation] += avg_ln_weight_magnitude
+            self.results_dict["average_ln_weight_magnitude_per_checkpoint"][permutation_step] += avg_ln_weight_magnitude
+            if self.tb_logger is not None:
+                self.tb_logger.log_scalar("permutation/average_ln_weight_magnitude",
+                                          avg_ln_weight_magnitude,
+                                          permutation_step)
 
     def store_extended_summaries(self, current_loss: torch.Tensor, current_activations: list = None) -> None:
         """ Stores the extended summaries related to the topology update of CBP and CBPw """
@@ -236,23 +256,44 @@ class PermutedMNISTExperimentBase(Experiment):
 
     def store_before_reinitialization_summaries(self, current_loss: torch.Tensor):
         self.results_dict["loss_before_topology_update"].append(current_loss)
-        self.results_dict["avg_grad_before_topology_update"].append(compute_average_gradient_magnitude(self.net))
+        avg_grad = compute_average_gradient_magnitude(self.net)
+        self.results_dict["avg_grad_before_topology_update"].append(avg_grad)
+        if self.tb_logger is not None:
+            step = len(self.results_dict["loss_before_topology_update"]) - 1
+            self.tb_logger.log_scalar("reinit/loss_before_topology_update", current_loss, step)
+            self.tb_logger.log_scalar("reinit/avg_grad_before_topology_update", avg_grad, step)
 
     def store_after_reinitialization_summaries(self, current_loss: torch.Tensor):
         self.results_dict["loss_after_topology_update"].append(current_loss)
-        self.results_dict["avg_grad_after_topology_update"].append(compute_average_gradient_magnitude(self.net))
+        avg_grad = compute_average_gradient_magnitude(self.net)
+        self.results_dict["avg_grad_after_topology_update"].append(avg_grad)
+        if self.tb_logger is not None:
+            step = len(self.results_dict["loss_after_topology_update"]) - 1
+            self.tb_logger.log_scalar("reinit/loss_after_topology_update", current_loss, step)
+            self.tb_logger.log_scalar("reinit/avg_grad_after_topology_update", avg_grad, step)
 
     def store_change_in_activation_statistics_summaries(self, current_activations: list[torch.Tensor]):
         for i in range(len(current_activations)):
             diff_average_act = current_activations[i].mean().detach() - self.previous_activations[i].mean().detach()
             diff_std_act = current_activations[i].std().detach() - self.previous_activations[i].std().detach()
-            self.results_dict[f"change_in_average_activation_layer_{i + 1}"].append(diff_average_act.abs())
-            self.results_dict[f"change_in_std_activation_layer_{i + 1}"].append(diff_std_act.abs())
+            abs_diff_average_act = diff_average_act.abs()
+            abs_diff_std_act = diff_std_act.abs()
+            avg_key = f"change_in_average_activation_layer_{i + 1}"
+            std_key = f"change_in_std_activation_layer_{i + 1}"
+            self.results_dict[avg_key].append(abs_diff_average_act)
+            self.results_dict[std_key].append(abs_diff_std_act)
+            if self.tb_logger is not None:
+                avg_step = len(self.results_dict[avg_key]) - 1
+                std_step = len(self.results_dict[std_key]) - 1
+                self.tb_logger.log_scalar(f"reinit/{avg_key}", abs_diff_average_act, avg_step)
+                self.tb_logger.log_scalar(f"reinit/{std_key}", abs_diff_std_act, std_step)
 
     def store_num_replace_summary(self):
         if not self.use_cbp and not self.use_redo and not self.use_swr: return
         num_replaced = self.swr_optim.num_replaced if self.use_swr else sum(self.net.num_replaced())
         self.results_dict["num_replaced"].append(num_replaced)
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("reinit/num_replaced", num_replaced, len(self.results_dict["num_replaced"]) - 1)
 
     def post_process_extended_results(self):
         using_cbp_or_swr_or_redo = self.use_cbp or self.use_swr or self.use_redo

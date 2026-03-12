@@ -19,6 +19,7 @@ class IncrementalCIFARExperimentBase(Experiment):
 
     def __init__(self, exp_params: dict, results_dir: str, run_index: int, verbose=True):
         super().__init__(exp_params, results_dir, run_index, verbose)
+        self.tb_logger = None
 
     # ------------------------------ Methods for initializing the experiment ------------------------------
     def _initialize_summaries(self):
@@ -110,10 +111,16 @@ class IncrementalCIFARExperimentBase(Experiment):
 
     # --------------------------------------- For storing summaries --------------------------------------- #
     def _store_training_summaries(self):
-        self.results_dict["train_loss_per_checkpoint"][
-            self.current_running_avg_step] += self.running_loss / self.running_avg_window
-        self.results_dict["train_accuracy_per_checkpoint"][
-            self.current_running_avg_step] += self.running_accuracy / self.running_avg_window
+        checkpoint_step = self.current_running_avg_step
+        avg_loss = self.running_loss / self.running_avg_window
+        avg_acc = self.running_accuracy / self.running_avg_window
+
+        self.results_dict["train_loss_per_checkpoint"][checkpoint_step] += avg_loss
+        self.results_dict["train_accuracy_per_checkpoint"][checkpoint_step] += avg_acc
+
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("train/loss_per_checkpoint", avg_loss, checkpoint_step)
+            self.tb_logger.log_scalar("train/accuracy_per_checkpoint", avg_acc, checkpoint_step)
 
         # self._print("\t\tOnline accuracy: {0:.2f}".format(self.running_accuracy / self.running_avg_window))
         self.running_loss *= 0.0
@@ -125,6 +132,9 @@ class IncrementalCIFARExperimentBase(Experiment):
         """ Computes test summaries and stores them in results dir """
 
         self.results_dict["epoch_runtime"][epoch_number] += torch.tensor(epoch_runtime, dtype=torch.float32)
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("epoch/runtime_sec", epoch_runtime, epoch_number)
+            self.tb_logger.log_scalar("task/current_num_classes", self.current_num_classes, epoch_number)
 
         self.net.eval()
         for data_name, data_loader, compare_to_best in [("test", test_data, False), ("validation", val_data, True)]:
@@ -149,6 +159,10 @@ class IncrementalCIFARExperimentBase(Experiment):
                                                                                                dtype=torch.float32)
             self.results_dict[data_name + "_loss_per_epoch"][epoch_number] += loss
             self.results_dict[data_name + "_accuracy_per_epoch"][epoch_number] += accuracy
+            if self.tb_logger is not None:
+                self.tb_logger.log_scalar(f"{data_name}/eval_runtime_sec", evaluation_time, epoch_number)
+                self.tb_logger.log_scalar(f"{data_name}/loss_per_epoch", loss, epoch_number)
+                self.tb_logger.log_scalar(f"{data_name}/accuracy_per_epoch", accuracy, epoch_number)
 
             # print progress
             self._print(f"\t{data_name} accuracy: {accuracy:.4f}")
@@ -161,6 +175,10 @@ class IncrementalCIFARExperimentBase(Experiment):
 
         if self.swr_optim.reinit_indicator:
             self.results_dict["num_reinit"].append(self.swr_optim.num_replaced)
+            if self.tb_logger is not None:
+                self.tb_logger.log_scalar("swr/num_reinitialized_weights",
+                                          self.swr_optim.num_replaced,
+                                          len(self.results_dict["num_reinit"]) - 1)
             self.swr_optim.reset_reinit_indicator()
 
     def post_process_results(self):

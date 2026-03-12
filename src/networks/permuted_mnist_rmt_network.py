@@ -99,11 +99,13 @@ class MemoryTransformer(nn.Module):
         mem_tokens = memory_tokens.unsqueeze(0).expand(batch_size, -1, -1)
         sequence = torch.cat([mem_tokens, patch_embeddings], dim=1)
         sequence = sequence + self.pos_embed[:, :sequence.shape[1], :]
-
+        # Pass the sequence through the Transformer encoder
         encoded = self.transformer(sequence)
         logits = self.head(encoded[:, 0, :])
 
         if not return_encoded_memory:
             return logits
+        # The encoded memory tokens are the first n_mem tokens in the output sequence, 
+        # which correspond to the input memory tokens after being processed by the Transformer.
         encoded_memory = encoded[:, :self.n_mem, :]
         return logits, encoded_memory

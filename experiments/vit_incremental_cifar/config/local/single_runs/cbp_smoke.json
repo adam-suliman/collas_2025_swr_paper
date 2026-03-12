@@ -1,0 +1,31 @@
+{
+  "__comment_1__": "Quick smoke run for classic CBP on incremental CIFAR-100.",
+  "stepsize": 0.01,
+  "weight_decay": 6e-6,
+  "dropout_prob": 0.1,
+  "reparam_ln": true,
+  "use_lr_schedule": true,
+  "rescaled_wd": false,
+  "momentum": 0.9,
+
+  "__comment_2__": "Short incremental schedule for validation.",
+  "num_epochs": 20,
+  "initial_num_classes": 5,
+  "fixed_classes": false,
+  "class_increase": 5,
+  "class_increase_frequency": 10,
+  "use_best_network": true,
+
+  "__comment_3__": "Continual backpropagation settings. Slightly shortened maturity for smoke runs.",
+  "replacement_rate": 1e-6,
+  "maturity_threshold": 100,
+
+  "__comment_4__": "Result folder naming.",
+  "relevant_parameters": [
+    "reparam_ln",
+    "replacement_rate",
+    "maturity_threshold",
+    "num_epochs",
+    "class_increase_frequency"
+  ]
+}

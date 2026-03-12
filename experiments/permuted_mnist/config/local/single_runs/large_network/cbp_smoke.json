@@ -1,0 +1,25 @@
+{
+  "__comment_1__": "Quick smoke run for classic CBP on PermutedMNIST.",
+  "stepsize": 0.05,
+
+  "__comment_2__": "Network and diagnostics.",
+  "num_hidden": 100,
+  "extended_summaries": true,
+
+  "__comment_3__": "Short continual learning schedule.",
+  "num_permutations": 5,
+
+  "__comment_4__": "Continual backpropagation settings.",
+  "maturity_threshold": 1,
+  "replacement_rate": 1e-4,
+  "cbp_utility": "contribution",
+
+  "__comment_5__": "Result folder naming.",
+  "relevant_parameters": [
+    "num_hidden",
+    "maturity_threshold",
+    "replacement_rate",
+    "cbp_utility",
+    "num_permutations"
+  ]
+}

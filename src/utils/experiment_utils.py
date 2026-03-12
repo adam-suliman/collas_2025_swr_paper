@@ -11,6 +11,10 @@ def parse_terminal_arguments():
                                  help="This determines the random seed for the experiment.")
     argument_parser.add_argument("-v", "--verbose", action="store_true", default=False)
     argument_parser.add_argument("--gpu_index", action="store", type=int, default=0)
+    argument_parser.add_argument("--tensorboard", action="store_true", default=False,
+                                 help="Enable TensorBoard logging for this run.")
+    argument_parser.add_argument("--tensorboard_log_dir", action="store", type=str, default=None,
+                                 help="Base directory where TensorBoard logs are written.")
     return argument_parser.parse_args()
 
 

@@ -32,6 +32,7 @@
 
   "__comment_4__": "Optional diagnostics.",
   "extended_summaries": true,
+  "log_rmt_minibatch_losses": true,
   "parameter_noise_var": 0.0,
 
   "__comment_5__": "Result folder naming.",

@@ -1,4 +1,5 @@
 # built-in libraries
+import json
 import os
 import pickle
 import time
@@ -24,6 +25,7 @@ from src.swr_functions import SelectiveWeightReinitialization, get_network_init_
 from src.utils import IncrementalCIFARExperimentBase
 from src.utils import compute_accuracy_from_batch, get_cifar_data
 from src.utils import save_model_parameters, set_random_seed
+from src.utils.tensorboard_logging import TensorBoardLogger
 
 
 class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
@@ -62,6 +64,18 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
         # summary parameters
         self.extended_summaries = access_dict(exp_params, "extended_summaries", default=False, val_type=bool)
+        self.use_tensorboard = access_dict(exp_params, "use_tensorboard", default=False, val_type=bool)
+        self.tensorboard_log_dir = access_dict(exp_params,
+                                               "tensorboard_log_dir",
+                                               default=os.path.join(self.results_dir, "tensorboard"),
+                                               val_type=str)
+        self.tensorboard_flush_secs = access_dict(exp_params, "tensorboard_flush_secs", default=30, val_type=int)
+        self.log_rmt_minibatch_losses = access_dict(exp_params,
+                                                    "log_rmt_minibatch_losses",
+                                                    default=False,
+                                                    val_type=bool)
+        if self.tensorboard_flush_secs <= 0:
+            raise ValueError("tensorboard_flush_secs must be >= 1.")
 
         # model selection
         self.model_family = access_dict(exp_params, "model_family", default="vit", val_type=str,
@@ -109,6 +123,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.rmt_mlp_ratio = access_dict(exp_params, "rmt_mlp_ratio", default=4.0, val_type=float)
         self.rmt_n_mem = access_dict(exp_params, "rmt_n_mem", default=2, val_type=int)
         self.rmt_fast_lr = access_dict(exp_params, "rmt_fast_lr", default=0.1, val_type=float)
+        self.rmt_inner_memory_l2 = access_dict(exp_params, "rmt_inner_memory_l2", default=0.0, val_type=float)
         self.rmt_slow_update_freq = access_dict(exp_params, "rmt_slow_update_freq", default=10, val_type=int)
         self.rmt_memory_reset_at_task_boundary = access_dict(exp_params, "rmt_memory_reset_at_task_boundary",
                                                              default=True, val_type=bool)
@@ -190,6 +205,11 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.current_running_avg_step, self.running_loss, self.running_accuracy = (0, 0.0, 0.0)
         self._initialize_summaries()
         self._initialize_rmt_summaries_if_needed()
+        self.tb_logger = TensorBoardLogger(enabled=self.use_tensorboard,
+                                           log_dir=self.tensorboard_log_dir,
+                                           run_index=self.run_index,
+                                           flush_secs=self.tensorboard_flush_secs)
+        self.tb_logger.log_text("run/config", json.dumps(exp_params, indent=2, sort_keys=True, default=str), step=0)
 
     def _build_vit_model(self) -> VisionTransformer:
         net = VisionTransformer(
@@ -247,14 +267,30 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             return
         self.rmt_running_memory_norm += memory_norm.detach()
         self.rmt_running_memory_update_norm += memory_update_norm.detach()
+   # log memory loss and memory loss improvement at each minibatch for fast_memory variant
+    def _log_rmt_minibatch_losses(self, memory_loss: torch.Tensor, memory_loss_improvement: torch.Tensor):
+        if (not self.log_rmt_minibatch_losses or
+                self.tb_logger is None or
+                self.model_family != "rmt" or
+                self.rmt_variant != "fast_memory"):
+            return
+        self.tb_logger.log_scalar("rmt/memory_loss_per_minibatch", memory_loss, self.rmt_global_step)
+        self.tb_logger.log_scalar("rmt/memory_loss_improvement_per_minibatch",
+                                  memory_loss_improvement,
+                                  self.rmt_global_step)
 
     def _store_training_summaries(self):
         super()._store_training_summaries()
         if self.model_family != "rmt" or not self.extended_summaries:
             return
         idx = self.current_running_avg_step - 1
-        self.results_dict["rmt_memory_norm_per_checkpoint"][idx] += self.rmt_running_memory_norm / self.running_avg_window
-        self.results_dict["rmt_memory_update_norm_per_checkpoint"][idx] += self.rmt_running_memory_update_norm / self.running_avg_window
+        avg_memory_norm = self.rmt_running_memory_norm / self.running_avg_window
+        avg_memory_update_norm = self.rmt_running_memory_update_norm / self.running_avg_window
+        self.results_dict["rmt_memory_norm_per_checkpoint"][idx] += avg_memory_norm
+        self.results_dict["rmt_memory_update_norm_per_checkpoint"][idx] += avg_memory_update_norm
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("rmt/memory_norm_per_checkpoint", avg_memory_norm, idx)
+            self.tb_logger.log_scalar("rmt/memory_update_norm_per_checkpoint", avg_memory_update_norm, idx)
         self.rmt_running_memory_norm *= 0.0
         self.rmt_running_memory_update_norm *= 0.0
 
@@ -333,6 +369,9 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             return
 
         self.results_dict["epoch_runtime"][epoch_number] += torch.tensor(epoch_runtime, dtype=torch.float32)
+        if self.tb_logger is not None:
+            self.tb_logger.log_scalar("epoch/runtime_sec", epoch_runtime, epoch_number)
+            self.tb_logger.log_scalar("task/current_num_classes", self.current_num_classes, epoch_number)
         eval_memory = self.rmt_memory.detach().clone() if self.rmt_memory is not None else self._initialize_rmt_memory(False)
 
         self.net.eval()
@@ -354,6 +393,10 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             self.results_dict[data_name + "_evaluation_runtime"][epoch_number] += torch.tensor(evaluation_time, dtype=torch.float32)
             self.results_dict[data_name + "_loss_per_epoch"][epoch_number] += loss
             self.results_dict[data_name + "_accuracy_per_epoch"][epoch_number] += accuracy
+            if self.tb_logger is not None:
+                self.tb_logger.log_scalar(f"{data_name}/eval_runtime_sec", evaluation_time, epoch_number)
+                self.tb_logger.log_scalar(f"{data_name}/loss_per_epoch", loss, epoch_number)
+                self.tb_logger.log_scalar(f"{data_name}/accuracy_per_epoch", accuracy, epoch_number)
             self._print(f"\t{data_name} accuracy: {accuracy:.4f}")
 
         self.net.train()
@@ -456,26 +499,48 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                     memory_update_norm = (next_memory - self.rmt_memory.detach()).norm()
                     self.rmt_memory = next_memory
             else:
+                # Inner (fast) update: compute memory gradient only.
                 if not self.rmt_memory.requires_grad:
                     self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
 
-                predictions = self.net.forward(image, self.rmt_memory)[:, active_classes]
-                current_loss = self.loss(predictions, label)
-                detached_loss = current_loss.detach().clone()
-                current_loss.backward()
+                # Detach the loss to prevent gradients from flowing back through the memory update into the model parameters during the
+                # fast update step. This ensures that the inner update optimizes the memory tokens for the current model parameters 
+                # without affecting the model parameters themselves, which are only updated during the outer loop.
+                inner_predictions = self.net.forward(image, self.rmt_memory)[:, active_classes]
+                inner_loss = self.loss(inner_predictions, label)
+                if self.rmt_inner_memory_l2 > 0.0:
+                    inner_loss = inner_loss + 0.5 * self.rmt_inner_memory_l2 * torch.mean(self.rmt_memory ** 2)
+                memory_loss = inner_loss.detach().clone()
+                memory_grad = torch.autograd.grad(
+                    inner_loss, self.rmt_memory, retain_graph=False, create_graph=False, allow_unused=True
+                )[0]
 
                 memory_update_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
                 with torch.no_grad():
-                    if self.rmt_memory.grad is not None:
+                    if memory_grad is not None:
                         if self.rmt_clip_memory_grad is not None:
-                            grad_norm = self.rmt_memory.grad.norm()
+                            grad_norm = memory_grad.norm()
                             if grad_norm > self.rmt_clip_memory_grad:
                                 scaling = self.rmt_clip_memory_grad / (grad_norm + 1e-12)
-                                self.rmt_memory.grad.mul_(scaling)
-                        memory_step = self.rmt_fast_lr * self.rmt_memory.grad
-                        self.rmt_memory -= memory_step
+                                memory_grad = memory_grad * scaling
+                        memory_step = self.rmt_fast_lr * memory_grad
+                        self.rmt_memory = (self.rmt_memory - memory_step).detach()
                         memory_update_norm = memory_step.norm()
-                self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
+                    else:
+                        self.rmt_memory = self.rmt_memory.detach()
+
+                # Outer (slow) update: compute model gradients using adapted memory.
+                predictions = self.net.forward(image, self.rmt_memory)[:, active_classes]
+                current_loss = self.loss(predictions, label)
+                detached_loss = current_loss.detach().clone()
+                post_memory_loss = detached_loss
+                if self.rmt_inner_memory_l2 > 0.0:
+                    post_memory_loss = post_memory_loss + 0.5 * self.rmt_inner_memory_l2 * torch.mean(
+                        self.rmt_memory.detach() ** 2
+                    )
+                self._log_rmt_minibatch_losses(memory_loss=memory_loss,
+                                               memory_loss_improvement=memory_loss - post_memory_loss)
+                current_loss.backward()
 
             # Slow updates must be scheduled in epoch-local coordinates so the
             # optimizer/scheduler step counts match steps_per_epoch exactly.
@@ -587,6 +652,10 @@ def main():
     terminal_arguments = parse_terminal_arguments()
     experiment_parameters = read_json_file(terminal_arguments.config_file)
     file_path = os.path.dirname(os.path.abspath(__file__))
+    if terminal_arguments.tensorboard:
+        experiment_parameters["use_tensorboard"] = True
+    if terminal_arguments.tensorboard_log_dir is not None:
+        experiment_parameters["tensorboard_log_dir"] = terminal_arguments.tensorboard_log_dir
 
     experiment_parameters["data_path"] = os.path.join(file_path, "data")
     print(experiment_parameters)
@@ -603,8 +672,12 @@ def main():
                                      run_index=terminal_arguments.run_index,
                                      verbose=terminal_arguments.verbose,
                                      gpu_index=terminal_arguments.gpu_index)
-    exp.run()
-    exp.store_results()
+    try:
+        exp.run()
+        exp.store_results()
+    finally:
+        if getattr(exp, "tb_logger", None) is not None:
+            exp.tb_logger.close()
     final_time = time.perf_counter()
     print("The running time in minutes is: {0:.2f}".format((final_time - initial_time) / 60))
 

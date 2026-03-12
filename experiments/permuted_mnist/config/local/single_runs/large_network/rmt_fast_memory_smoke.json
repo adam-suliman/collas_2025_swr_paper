@@ -10,6 +10,7 @@
   "num_permutations": 5,
   "batch_size": 30,
   "extended_summaries": true,
+  "log_rmt_minibatch_losses": true,
   "rmt_patch_size": 4,
   "rmt_d_model": 64,
   "rmt_n_layers": 2,
