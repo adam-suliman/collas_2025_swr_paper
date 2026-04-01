@@ -371,6 +371,9 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
 
     def _train_rmt(self, mnist_data_loader: DataLoader, training_data: MnistDataSet):
         self.rmt_memory = self._initialize_rmt_memory()
+        num_batches = len(mnist_data_loader)
+        # Average accumulated outer gradients over the true chunk size, including the final short chunk.
+        tail_batches = num_batches % self.rmt_slow_update_freq
 
         for _ in tqdm(range(self.num_permutations), disable=not self.verbose):
             if self.current_permutation == self.num_permutations:
@@ -382,18 +385,20 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
             elif self.rmt_variant == "fast_memory" and not self.rmt_memory.requires_grad:
                 self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
 
+            self.optim.zero_grad(set_to_none=True)
             for i, sample in enumerate(mnist_data_loader):
                 self.current_experiment_step += 1
 
                 image = self._prepare_rmt_images(sample["image"])
                 label = self._prepare_rmt_labels(sample["label"])
-                self.optim.zero_grad(set_to_none=True)
+                is_tail_accumulation = tail_batches != 0 and i >= (num_batches - tail_batches)
+                accumulation_divisor = tail_batches if is_tail_accumulation else self.rmt_slow_update_freq
 
                 if self.rmt_variant == "baseline":
                     predictions, encoded_memory = self.net.forward(image, self.rmt_memory, return_encoded_memory=True)
                     current_loss = self.loss(predictions, label)
                     detached_loss = current_loss.detach().clone()
-                    current_loss.backward()
+                    (current_loss / accumulation_divisor).backward()
 
                     with torch.no_grad():
                         next_memory = encoded_memory.detach().mean(dim=0)
@@ -408,17 +413,19 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
                     current_loss = self.loss(predictions, label)
                     detached_loss = current_loss.detach().clone()
                     memory_loss = detached_loss
-                    current_loss.backward()
+                    (current_loss / accumulation_divisor).backward()
 
                     memory_update_norm = torch.tensor(0.0, device=self.device, dtype=torch.float32)
                     with torch.no_grad():
                         if self.rmt_memory.grad is not None:
+                            # Undo the outer-loss normalization so the per-minibatch memory update stays unchanged.
+                            memory_grad = self.rmt_memory.grad * accumulation_divisor
                             if self.rmt_clip_memory_grad is not None:
-                                grad_norm = self.rmt_memory.grad.norm()
+                                grad_norm = memory_grad.norm()
                                 if grad_norm > self.rmt_clip_memory_grad:
                                     scaling = self.rmt_clip_memory_grad / (grad_norm + 1e-12)
-                                    self.rmt_memory.grad.mul_(scaling)
-                            memory_step = self.rmt_fast_lr * self.rmt_memory.grad
+                                    memory_grad = memory_grad * scaling
+                            memory_step = self.rmt_fast_lr * memory_grad
                             self.rmt_memory -= memory_step
                             memory_update_norm = memory_step.norm()
                         updated_memory = self.rmt_memory.detach()
@@ -426,14 +433,15 @@ class PermutedMNISTExperiment(PermutedMNISTExperimentBase):
                             post_memory_predictions = self.net.forward(image, updated_memory)
                             post_memory_loss = self.loss(post_memory_predictions, label).detach()
                             self._log_rmt_minibatch_losses(memory_loss=memory_loss,
-                                                           memory_loss_improvement=memory_loss - post_memory_loss)
+                                   memory_loss_improvement=memory_loss - post_memory_loss)
                     self.rmt_memory = self.rmt_memory.detach().requires_grad_(True)
 
-                if (self.rmt_global_step % self.rmt_slow_update_freq) == 0:
+                if ((i + 1) % self.rmt_slow_update_freq) == 0 or (i + 1) == num_batches:
                     self.optim.step()
                     self.rmt_optimizer_step_count += 1
                     if self.use_parameter_noise:
                         perturb_weights(self.net, self.parameter_noise_var)
+                    self.optim.zero_grad(set_to_none=True)
 
                 current_accuracy = torch.mean((predictions.argmax(axis=1) == label).to(torch.float32))
                 self.running_loss += detached_loss
