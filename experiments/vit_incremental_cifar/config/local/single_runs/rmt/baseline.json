@@ -3,7 +3,7 @@
   "stepsize": 0.01,
   "weight_decay": 6e-6,
   "dropout_prob": 0.1,
-  "reparam_ln": false,
+  "reparam_ln": true,
   "use_lr_schedule": true,
   "rescaled_wd": false,
   "momentum": 0.9,
