@@ -12,3 +12,13 @@ share/
 *.pyc
 data/
 .DS_Store
+
+# Local experiment run helpers
+scripts/run_*
+
+# Local experiment outputs
+results/
+short test results/
+
+# Local Hamilton visualization sidecar
+hamilton_viz/
