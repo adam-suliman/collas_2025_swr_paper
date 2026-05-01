@@ -1,5 +1,6 @@
 # built-in libraries
 import json
+import math
 import os
 import pickle
 import time
@@ -80,6 +81,10 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                                                     val_type=bool)
         if self.tensorboard_flush_secs <= 0:
             raise ValueError("tensorboard_flush_secs must be >= 1.")
+        self.keep_all_experiment_checkpoints = access_dict(exp_params,
+                                                           "keep_all_experiment_checkpoints",
+                                                           default=False,
+                                                           val_type=bool)
 
         # model selection
         self.model_family = access_dict(exp_params, "model_family", default="vit", val_type=str,
@@ -127,8 +132,25 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.rmt_mlp_ratio = access_dict(exp_params, "rmt_mlp_ratio", default=4.0, val_type=float)
         self.rmt_n_mem = access_dict(exp_params, "rmt_n_mem", default=2, val_type=int)
         self.rmt_fast_lr = access_dict(exp_params, "rmt_fast_lr", default=0.1, val_type=float)
+        self.rmt_fast_lr_schedule = access_dict(exp_params,
+                                                "rmt_fast_lr_schedule",
+                                                default="constant",
+                                                val_type=str,
+                                                choices=["constant", "task_linear_decay", "task_cosine_decay"])
+        self.rmt_fast_lr_min = access_dict(exp_params,
+                                           "rmt_fast_lr_min",
+                                           default=self.rmt_fast_lr,
+                                           val_type=float)
         self.rmt_inner_memory_l2 = access_dict(exp_params, "rmt_inner_memory_l2", default=0.0, val_type=float)
         self.rmt_slow_update_freq = access_dict(exp_params, "rmt_slow_update_freq", default=10, val_type=int)
+        self.rmt_slow_update_freq_switch_task = exp_params["rmt_slow_update_freq_switch_task"] \
+            if "rmt_slow_update_freq_switch_task" in exp_params else None
+        self.rmt_slow_update_freq_after_switch = exp_params["rmt_slow_update_freq_after_switch"] \
+            if "rmt_slow_update_freq_after_switch" in exp_params else None
+        self.rmt_fast_lr_switch_task = exp_params["rmt_fast_lr_switch_task"] \
+            if "rmt_fast_lr_switch_task" in exp_params else None
+        self.rmt_fast_lr_after_switch = exp_params["rmt_fast_lr_after_switch"] \
+            if "rmt_fast_lr_after_switch" in exp_params else None
         self.rmt_meta_write_steps = access_dict(exp_params, "rmt_meta_write_steps", default=1, val_type=int)
         self.rmt_meta_support_fraction = access_dict(exp_params,
                                                      "rmt_meta_support_fraction",
@@ -150,6 +172,10 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                                                           default=False, val_type=bool)
         self.rmt_memory_prior_init_std = access_dict(exp_params, "rmt_memory_prior_init_std",
                                                      default=0.02, val_type=float)
+        self.rmt_baseline_memory_ema_beta = access_dict(exp_params,
+                                                        "rmt_baseline_memory_ema_beta",
+                                                        default=0.0,
+                                                        val_type=float)
         # access_dict enforces exact types for existing keys; allow explicit null in JSON for this optional field.
         clip_grad_value = exp_params["rmt_clip_memory_grad"] if "rmt_clip_memory_grad" in exp_params else None
         if clip_grad_value is not None and not isinstance(clip_grad_value, (float, int)):
@@ -157,6 +183,14 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.rmt_clip_memory_grad = None if clip_grad_value is None else float(clip_grad_value)
         if self.rmt_slow_update_freq <= 0:
             raise ValueError("rmt_slow_update_freq must be >= 1.")
+        self._validate_rmt_task_switch_fields()
+        if self.rmt_fast_lr_min < 0.0:
+            raise ValueError("rmt_fast_lr_min must be >= 0.")
+        max_fast_lr_for_validation = self.rmt_fast_lr
+        if self.rmt_fast_lr_after_switch is not None:
+            max_fast_lr_for_validation = min(max_fast_lr_for_validation, self.rmt_fast_lr_after_switch)
+        if self.rmt_fast_lr_min > max_fast_lr_for_validation:
+            raise ValueError("rmt_fast_lr_min must be <= min(rmt_fast_lr, rmt_fast_lr_after_switch when set).")
         if self.rmt_meta_write_steps <= 0:
             raise ValueError("rmt_meta_write_steps must be >= 1.")
         if not (0.0 < self.rmt_meta_support_fraction < 1.0):
@@ -167,6 +201,14 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             raise ValueError("At least one meta loss weight must be > 0.")
         if self.rmt_memory_prior_init_std < 0.0:
             raise ValueError("rmt_memory_prior_init_std must be >= 0.")
+        if not (0.0 <= self.rmt_baseline_memory_ema_beta < 1.0):
+            raise ValueError("rmt_baseline_memory_ema_beta must satisfy 0.0 <= beta < 1.0.")
+        if (self.rmt_baseline_memory_ema_beta > 0.0 and
+                (self.model_family != "rmt" or self.rmt_variant != "baseline")):
+            raise ValueError("rmt_baseline_memory_ema_beta > 0 is only supported for baseline RMT.")
+        if (self.rmt_fast_lr_schedule != "constant" and
+                (self.model_family != "rmt" or self.rmt_variant not in ["fast_memory", "meta_fast_memory"])):
+            raise ValueError("Non-constant rmt_fast_lr_schedule is only supported for fast_memory and meta_fast_memory.")
         if self.rmt_variant == "meta_fast_memory":
             # The meta-memory prototype always starts from a shared trainable initializer.
             self.rmt_use_learnable_memory_prior = True
@@ -235,7 +277,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.experiment_checkpoints_dir_path = os.path.join(self.results_dir, "experiment_checkpoints")
         self.checkpoint_identifier_name = "current_epoch"
         self.checkpoint_save_frequency = self.class_increase_frequency
-        self.delete_old_checkpoints = True
+        self.delete_old_checkpoints = not self.keep_all_experiment_checkpoints
 
         # For summaries
         self.running_avg_window = 25
@@ -333,6 +375,48 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.rmt_running_memory_norm += memory_norm.detach()
         self.rmt_running_memory_update_norm += memory_update_norm.detach()
 
+    def _validate_rmt_task_switch_fields(self):
+        switch_pairs = [
+            ("rmt_slow_update_freq_switch_task", self.rmt_slow_update_freq_switch_task,
+             "rmt_slow_update_freq_after_switch", self.rmt_slow_update_freq_after_switch),
+            ("rmt_fast_lr_switch_task", self.rmt_fast_lr_switch_task,
+             "rmt_fast_lr_after_switch", self.rmt_fast_lr_after_switch),
+        ]
+        for task_name, task_value, after_name, after_value in switch_pairs:
+            if (task_value is None) != (after_value is None):
+                raise ValueError(f"{task_name} and {after_name} must either both be set or both be null.")
+
+        if self.rmt_slow_update_freq_switch_task is not None:
+            if not isinstance(self.rmt_slow_update_freq_switch_task, int):
+                raise ValueError("rmt_slow_update_freq_switch_task must be an integer or null.")
+            if self.rmt_slow_update_freq_switch_task < 1:
+                raise ValueError("rmt_slow_update_freq_switch_task must be >= 1.")
+            if not isinstance(self.rmt_slow_update_freq_after_switch, int):
+                raise ValueError("rmt_slow_update_freq_after_switch must be an integer or null.")
+            if self.rmt_slow_update_freq_after_switch < 1:
+                raise ValueError("rmt_slow_update_freq_after_switch must be >= 1.")
+
+        if self.rmt_fast_lr_switch_task is not None:
+            if not isinstance(self.rmt_fast_lr_switch_task, int):
+                raise ValueError("rmt_fast_lr_switch_task must be an integer or null.")
+            if self.rmt_fast_lr_switch_task < 1:
+                raise ValueError("rmt_fast_lr_switch_task must be >= 1.")
+            if not isinstance(self.rmt_fast_lr_after_switch, (float, int)):
+                raise ValueError("rmt_fast_lr_after_switch must be a numeric value or null.")
+            self.rmt_fast_lr_after_switch = float(self.rmt_fast_lr_after_switch)
+            if self.rmt_fast_lr_after_switch < 0.0:
+                raise ValueError("rmt_fast_lr_after_switch must be >= 0.")
+
+        if self.fixed_classes:
+            if self.rmt_slow_update_freq_switch_task is not None and self.rmt_slow_update_freq_switch_task > 1:
+                raise ValueError("fixed_classes=True only supports rmt_slow_update_freq_switch_task = 1.")
+            if self.rmt_fast_lr_switch_task is not None and self.rmt_fast_lr_switch_task > 1:
+                raise ValueError("fixed_classes=True only supports rmt_fast_lr_switch_task = 1.")
+
+        if ((self.rmt_slow_update_freq_switch_task is not None or self.rmt_fast_lr_switch_task is not None) and
+                (self.model_family != "rmt" or self.rmt_variant not in ["fast_memory", "meta_fast_memory"])):
+            raise ValueError("RMT task switches are only supported for fast_memory and meta_fast_memory.")
+
     # Log fast-memory inner-objective diagnostics once per minibatch.
     def _log_rmt_minibatch_losses(self, memory_loss: torch.Tensor, memory_loss_improvement: torch.Tensor):
         if (not self.log_rmt_minibatch_losses or
@@ -358,6 +442,21 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         self.tb_logger.log_scalar("rmt/meta_support_accuracy_per_minibatch", support_accuracy, self.rmt_global_step)
         self.tb_logger.log_scalar("rmt/meta_query_accuracy_per_minibatch", query_accuracy, self.rmt_global_step)
         self.tb_logger.log_scalar("rmt/meta_query_improvement_per_minibatch", query_improvement, self.rmt_global_step)
+
+    def _log_rmt_fast_lr(self, current_fast_lr: float):
+        if self.tb_logger is None or self.model_family != "rmt" or self.rmt_variant not in ["fast_memory", "meta_fast_memory"]:
+            return
+        self.tb_logger.log_scalar("rmt/fast_lr_per_minibatch", current_fast_lr, self.rmt_global_step)
+
+    def _log_rmt_active_task_switch_values(self, epoch_number: int):
+        if self.tb_logger is None or self.model_family != "rmt" or self.rmt_variant not in ["fast_memory", "meta_fast_memory"]:
+            return
+        self.tb_logger.log_scalar("rmt/active_slow_update_freq_per_epoch",
+                                  self._get_active_rmt_slow_update_freq(),
+                                  epoch_number)
+        self.tb_logger.log_scalar("rmt/active_fast_lr_base_per_epoch",
+                                  self._get_active_rmt_fast_lr_base(),
+                                  epoch_number)
 
     @staticmethod
     def _weighted_accuracy(acc_values: list[torch.Tensor], counts: list[int]) -> torch.Tensor:
@@ -395,7 +494,8 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                                 support_image: torch.Tensor,
                                 support_label: torch.Tensor,
                                 active_classes: torch.Tensor,
-                                start_memory: torch.Tensor):
+                                start_memory: torch.Tensor,
+                                current_fast_lr: float):
         adapted_memory = start_memory
         last_memory_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
@@ -427,10 +527,57 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                     scaling = self.rmt_clip_memory_grad / (grad_norm + 1e-12)
                     memory_grad = memory_grad * scaling
 
-            adapted_memory = adapted_memory - self.rmt_fast_lr * memory_grad
+            adapted_memory = adapted_memory - current_fast_lr * memory_grad
 
         memory_update_norm = (adapted_memory.detach() - start_memory.detach()).norm()
         return adapted_memory, memory_update_norm, last_memory_loss
+
+    def _get_current_task_index(self) -> int:
+        if self.fixed_classes:
+            return 1
+        return 1 + (self.current_epoch // self.class_increase_frequency)
+
+    def _get_active_rmt_slow_update_freq(self) -> int:
+        current_task_index = self._get_current_task_index()
+        if (self.rmt_slow_update_freq_switch_task is not None and
+                current_task_index >= self.rmt_slow_update_freq_switch_task):
+            return self.rmt_slow_update_freq_after_switch
+        return self.rmt_slow_update_freq
+
+    def _get_active_rmt_fast_lr_base(self) -> float:
+        current_task_index = self._get_current_task_index()
+        if self.rmt_fast_lr_switch_task is not None and current_task_index >= self.rmt_fast_lr_switch_task:
+            return self.rmt_fast_lr_after_switch
+        return self.rmt_fast_lr
+
+    def _get_current_rmt_fast_lr(self, step_number: int, num_batches: int) -> float:
+        active_fast_lr = self._get_active_rmt_fast_lr_base()
+        if self.rmt_fast_lr_schedule == "constant":
+            return active_fast_lr
+
+        task_start_epoch = 0 if self.fixed_classes else (
+            self.current_epoch // self.class_increase_frequency
+        ) * self.class_increase_frequency
+        task_epochs = self.num_epochs - task_start_epoch if self.fixed_classes else min(
+            self.class_increase_frequency,
+            self.num_epochs - task_start_epoch
+        )
+        task_epochs = max(1, task_epochs)
+        batches_per_epoch = max(1, num_batches)
+        epoch_in_task = self.current_epoch - task_start_epoch
+        current_task_step = epoch_in_task * batches_per_epoch + step_number
+        total_task_steps = task_epochs * batches_per_epoch
+        if total_task_steps <= 1:
+            progress = 0.0
+        else:
+            progress = current_task_step / (total_task_steps - 1)
+        progress = min(max(progress, 0.0), 1.0)
+
+        if self.rmt_fast_lr_schedule == "task_linear_decay":
+            return active_fast_lr - progress * (active_fast_lr - self.rmt_fast_lr_min)
+
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.rmt_fast_lr_min + (active_fast_lr - self.rmt_fast_lr_min) * cosine_factor
 
     def _store_training_summaries(self):
         super()._store_training_summaries()
@@ -604,7 +751,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
         if self.use_lr_schedule:
             if self.model_family == "rmt":
-                effective_steps = int(np.ceil(len(train_dataloader) / self.rmt_slow_update_freq))
+                effective_steps = int(np.ceil(len(train_dataloader) / self._get_active_rmt_slow_update_freq()))
                 self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=max(1, effective_steps))
             else:
                 self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=len(train_dataloader))
@@ -612,6 +759,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
         for e in range(self.current_epoch, self.num_epochs):
             self._print(f"Epoch: {e + 1}")
+            self._log_rmt_active_task_switch_values(epoch_number=e)
 
             epoch_start = time.perf_counter()
             if self.model_family == "vit":
@@ -669,14 +817,17 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
         active_classes = self.all_classes[:self.current_num_classes]
         num_batches = len(train_dataloader)
+        active_slow_update_freq = self._get_active_rmt_slow_update_freq()
         # Average accumulated outer gradients over the true chunk size, including the final short chunk.
-        tail_batches = num_batches % self.rmt_slow_update_freq
+        tail_batches = num_batches % active_slow_update_freq
         self.optim.zero_grad(set_to_none=True)
         for step_number, sample in enumerate(tqdm(train_dataloader)):
             image = sample["image"].to(self.device)
             label = sample["label"].to(self.device)
             is_tail_accumulation = tail_batches != 0 and step_number >= (num_batches - tail_batches)
-            accumulation_divisor = tail_batches if is_tail_accumulation else self.rmt_slow_update_freq
+            accumulation_divisor = tail_batches if is_tail_accumulation else active_slow_update_freq
+            current_fast_lr = self._get_current_rmt_fast_lr(step_number=step_number, num_batches=num_batches)
+            self._log_rmt_fast_lr(current_fast_lr)
 
             if self.rmt_variant == "baseline":
                 predictions, encoded_memory = self.net.forward(image, self.rmt_memory, return_encoded_memory=True)
@@ -686,8 +837,14 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                 (current_loss / accumulation_divisor).backward()
 
                 with torch.no_grad():
-                    next_memory = encoded_memory.detach().mean(dim=0)
-                    memory_update_norm = (next_memory - self.rmt_memory.detach()).norm()
+                    batch_memory = encoded_memory.detach().mean(dim=0)
+                    previous_memory = self.rmt_memory.detach()
+                    if self.rmt_baseline_memory_ema_beta > 0.0:
+                        beta = self.rmt_baseline_memory_ema_beta
+                        next_memory = beta * previous_memory + (1.0 - beta) * batch_memory
+                    else:
+                        next_memory = batch_memory
+                    memory_update_norm = (next_memory - previous_memory).norm()
                     self.rmt_memory = next_memory
             elif self.rmt_variant == "fast_memory":
                 # Inner (fast) update: compute memory gradient only.
@@ -713,7 +870,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                         if grad_norm > self.rmt_clip_memory_grad:
                             scaling = self.rmt_clip_memory_grad / (grad_norm + 1e-12)
                             memory_grad = memory_grad * scaling
-                    memory_step = self.rmt_fast_lr * memory_grad
+                    memory_step = current_fast_lr * memory_grad
                     memory_update_norm = memory_step.detach().norm()
                     if self.rmt_use_learnable_memory_prior:
                         # Keep a first-order path to the prior on the reset batch, then detach before the next batch.
@@ -751,7 +908,8 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                 adapted_memory, memory_update_norm, _ = self._meta_fast_memory_write(support_image,
                                                                                      support_label,
                                                                                      active_classes,
-                                                                                     self.rmt_memory)
+                                                                                     self.rmt_memory,
+                                                                                     current_fast_lr)
                 _, support_post_loss, support_post_accuracy = self._compute_rmt_supervised_loss(support_image,
                                                                                                 support_label,
                                                                                                 adapted_memory,
@@ -778,7 +936,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
             # Slow updates must be scheduled in epoch-local coordinates so the
             # optimizer/scheduler step counts match steps_per_epoch exactly.
-            do_slow_step = ((step_number + 1) % self.rmt_slow_update_freq) == 0 or (step_number + 1) == num_batches
+            do_slow_step = ((step_number + 1) % active_slow_update_freq) == 0 or (step_number + 1) == num_batches
             if do_slow_step:
                 self.optim.step()
                 self.rmt_optimizer_step_count += 1
@@ -856,7 +1014,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                 self.optim = self._get_optimizer()
             if self.use_lr_schedule:
                 if self.model_family == "rmt":
-                    effective_steps = int(np.ceil(len(train_dataloader) / self.rmt_slow_update_freq))
+                    effective_steps = int(np.ceil(len(train_dataloader) / self._get_active_rmt_slow_update_freq()))
                     self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=max(1, effective_steps))
                 else:
                     self.lr_scheduler = self.get_lr_scheduler(steps_per_epoch=len(train_dataloader))
