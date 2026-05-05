@@ -181,6 +181,8 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         if clip_grad_value is not None and not isinstance(clip_grad_value, (float, int)):
             raise ValueError("rmt_clip_memory_grad must be null or a numeric value.")
         self.rmt_clip_memory_grad = None if clip_grad_value is None else float(clip_grad_value)
+        if self.rmt_n_mem <= 0:
+            raise ValueError("rmt_n_mem must be >= 1.")
         if self.rmt_slow_update_freq <= 0:
             raise ValueError("rmt_slow_update_freq must be >= 1.")
         self._validate_rmt_task_switch_fields()
