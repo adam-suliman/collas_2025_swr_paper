@@ -1,24 +1,74 @@
-*cc.sh
-*egg-info/
-*temp_cfg/
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local environments
+.python-version
+venv/
+.venv/
+env/
+env_temp_cfg/
 *env_temp_cfg/
 bin/
 lib/
-.idea/
-pyvenv.cfg
-lop.egg-info
-__pycache__/
+lib64
 share/
-*.pyc
-data/
+pyvenv.cfg
+
+# Editor/OS files
 .DS_Store
+.idea/
+.vscode/
 
-# Local experiment run helpers
-scripts/run_*
+# Local data and downloaded archives
+data/
+experiments/**/data/
+experiments/**/cifar-100-python/
+experiments/**/cifar-100-python.tar.gz
+*.tar
+*.tar.gz
+*.tgz
+*.zip
 
-# Local experiment outputs
-results/
+# Experiment configs and generated run specs
+experiments/**/config/**
+!experiments/**/config/**/
+!experiments/**/config/**/*.md
+*temp_cfg/
+
+# Experiment outputs, checkpoints, logs, and plots
+results/**
+!results/**/
+!results/**/*.md
+experiments/**/results/**
+!experiments/**/results/**/
+!experiments/**/results/**/*.md
+experiments/**/analysis/**
+!experiments/**/analysis/**/
+!experiments/**/analysis/**/*.md
+plots/**
+!plots/**/
+!plots/**/*.md
+logs/
+runs/
+tensorboard/
+events.out.tfevents*
+model_parameters/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.svg
+*.pdf
 short test results/
-
-# Local Hamilton visualization sidecar
 hamilton_viz/
+
+# Local run helpers
+scripts/run_*
+*.fish
+*cc.sh
+archive_incremental_cifar_runs.py
