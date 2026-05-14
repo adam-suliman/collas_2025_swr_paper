@@ -79,16 +79,26 @@ class MemoryVisionTransformer(nn.Module):
             return_encoded_memory: bool = False,
             activations: list = None
     ):
-        if memory_tokens.ndim != 2:
-            raise ValueError(f"Expected memory_tokens with shape (n_mem, hidden_dim), got {tuple(memory_tokens.shape)}")
-        if memory_tokens.shape != (self.n_mem, self.hidden_dim):
+        if memory_tokens.ndim not in (2, 3):
             raise ValueError(
-                f"Expected memory_tokens shape ({self.n_mem}, {self.hidden_dim}), got {tuple(memory_tokens.shape)}"
+                "Expected memory_tokens with shape (n_mem, hidden_dim) or "
+                f"(batch_size, n_mem, hidden_dim), got {tuple(memory_tokens.shape)}"
+            )
+        if memory_tokens.shape[-2:] != (self.n_mem, self.hidden_dim):
+            raise ValueError(
+                f"Expected memory token tail shape ({self.n_mem}, {self.hidden_dim}), got {tuple(memory_tokens.shape)}"
             )
 
         x = self._process_input(x)
         batch_size = x.shape[0]
-        batch_memory = memory_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+        if memory_tokens.ndim == 2:
+            batch_memory = memory_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            if memory_tokens.shape[0] != batch_size:
+                raise ValueError(
+                    f"Expected per-sample memory batch size {batch_size}, got {memory_tokens.shape[0]}"
+                )
+            batch_memory = memory_tokens
         x = torch.cat((batch_memory, x), dim=1)
 
         encoded = self.encoder(x, activations=activations)

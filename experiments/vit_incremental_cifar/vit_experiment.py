@@ -124,7 +124,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
 
         # RMT parameters
         self.rmt_variant = access_dict(exp_params, "rmt_variant", default="fast_memory", val_type=str,
-                                       choices=["baseline", "fast_memory", "meta_fast_memory"])
+                                       choices=["baseline", "fast_memory", "meta_fast_memory", "batch_recurrent"])
         self.rmt_patch_size = access_dict(exp_params, "rmt_patch_size", default=4, val_type=int)
         self.rmt_d_model = access_dict(exp_params, "rmt_d_model", default=384, val_type=int)
         self.rmt_n_layers = access_dict(exp_params, "rmt_n_layers", default=8, val_type=int)
@@ -492,6 +492,21 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         accuracy = compute_accuracy_from_batch(predictions, label)
         return predictions, loss, accuracy
 
+    def _compute_batch_recurrent_memory(self, image: torch.Tensor, base_memory: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes per-sample memory for the current minibatch without averaging across unrelated images.
+        """
+        with torch.no_grad():
+            _, encoded_memory = self.net.forward(image, base_memory.detach(), return_encoded_memory=True)
+        return encoded_memory.detach()
+
+    def _compute_batch_recurrent_predictions(self,
+                                             image: torch.Tensor,
+                                             base_memory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        per_sample_memory = self._compute_batch_recurrent_memory(image, base_memory)
+        predictions = self.net.forward(image, per_sample_memory)
+        return predictions, per_sample_memory
+
     def _meta_fast_memory_write(self,
                                 support_image: torch.Tensor,
                                 support_label: torch.Tensor,
@@ -657,7 +672,11 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
         for sample in data_loader:
             images = sample["image"].to(self.device)
             labels = sample["label"].to(self.device)
-            preds = self.net.forward(images, frozen_memory)[:, active_classes]
+            if self.rmt_variant == "batch_recurrent":
+                preds, _ = self._compute_batch_recurrent_predictions(images, frozen_memory)
+                preds = preds[:, active_classes]
+            else:
+                preds = self.net.forward(images, frozen_memory)[:, active_classes]
             avg_loss += self.loss(preds, labels)
             avg_acc += compute_accuracy_from_batch(preds, labels)
             num_batches += 1
@@ -830,6 +849,7 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
             accumulation_divisor = tail_batches if is_tail_accumulation else active_slow_update_freq
             current_fast_lr = self._get_current_rmt_fast_lr(step_number=step_number, num_batches=num_batches)
             self._log_rmt_fast_lr(current_fast_lr)
+            memory_norm_for_summary = None
 
             if self.rmt_variant == "baseline":
                 predictions, encoded_memory = self.net.forward(image, self.rmt_memory, return_encoded_memory=True)
@@ -897,6 +917,16 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                 (current_loss / accumulation_divisor).backward()
                 if self.rmt_use_learnable_memory_prior:
                     self.rmt_memory = self.rmt_memory.detach()
+            elif self.rmt_variant == "batch_recurrent":
+                base_memory = self.rmt_memory.detach()
+                predictions, per_sample_memory = self._compute_batch_recurrent_predictions(image, base_memory)
+                predictions = predictions[:, active_classes]
+                current_loss = self.loss(predictions, label)
+                detached_loss = current_loss.detach().clone()
+                memory_delta = per_sample_memory - base_memory.unsqueeze(0)
+                memory_update_norm = memory_delta.norm(dim=(1, 2)).mean()
+                memory_norm_for_summary = per_sample_memory.norm(dim=(1, 2)).mean()
+                (current_loss / accumulation_divisor).backward()
             else:
                 (support_image, support_label), (query_image, query_label) = self._split_support_query_batch(image, label)
                 if not self.rmt_memory.requires_grad:
@@ -954,7 +984,10 @@ class IncrementalCIFARExperiment(IncrementalCIFARExperimentBase):
                 current_accuracy = compute_accuracy_from_batch(predictions, label)
             self.running_loss += detached_loss
             self.running_accuracy += current_accuracy.detach()
-            self._store_rmt_extended_summaries(memory_norm=self.rmt_memory.detach().norm(), memory_update_norm=memory_update_norm)
+            if memory_norm_for_summary is None:
+                memory_norm_for_summary = self.rmt_memory.detach().norm()
+            self._store_rmt_extended_summaries(memory_norm=memory_norm_for_summary,
+                                               memory_update_norm=memory_update_norm)
             if (step_number + 1) % self.running_avg_window == 0:
                 self._store_training_summaries()
 
