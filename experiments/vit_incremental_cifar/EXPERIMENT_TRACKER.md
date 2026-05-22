@@ -1,6 +1,6 @@
 # ViT Incremental CIFAR Experiment Tracker
 
-Generated from local result folders on 2026-05-14.
+Generated from local result folders on 2026-05-14. Paper-required seed coverage updated on 2026-05-22.
 
 ## Scope
 
@@ -21,6 +21,37 @@ Excluded:
 - Archived duplicate result trees, including `incremental_cifar_cbp_compact_archive`.
 
 `Final test acc` is the final epoch test accuracy. For multi-seed entries, it is reported as mean +/- population standard deviation over the listed run indices.
+
+## Paper Required Seed Coverage
+
+This table counts distinct `run_index` values for paper-relevant final comparisons. Duplicate directories with the same `run_index` are not counted as extra seeds. The target is at least 3 clean seeds per setup. Updated on 2026-05-22 from completed canonical 2000-epoch metric arrays.
+
+| Role | Setup | Clean Runs | Final Test Acc | Missing For 3 | Status |
+|---|---|---:|---:|---:|---|
+| Core baseline | Base ViT + reparam-LN | 0,1,2 | 0.5891 +/- 0.0025 | 0 | Complete |
+| Plasticity baseline | Base ViT + reparam-LN + full weight reset at task boundary | 0,1,2 | 0.5979 +/- 0.0016 | 0 | Complete |
+| Original baseline | ReDO + reparam-LN | 0,1,2 | 0.5879 +/- 0.0040 | 0 | Complete if included |
+| Original baseline | CBP best, `replacement_rate=1e-7`, `maturity=1000` | 0,1,2,3,4 | 0.5984 +/- 0.0038 | 0 | Complete |
+| Original baseline | SWR paper setup | 0,1,2 | 0.5924 +/- 0.0038 | 0 | Complete |
+| Optional baseline | Shrink and perturb | 0 | 0.5821 | 2 | Needs seeds 1,2 if included |
+| RMT baseline | Baseline, `n_mem=2`, `slow_freq=2`, task reset | 1,2 | 0.5394 +/- 0.0077 | 1 | Needs clean seed 0, unless the old seed-0 metric is repaired/accepted despite overwritten config metadata |
+| RMT baseline candidate | Baseline, `n_mem=2`, `slow_freq=2`, no task reset | 0 | 0.5504 | 2 | Needs seeds 1,2 if this becomes the baseline comparator |
+| RMT final | Fast memory, `n_mem=2`, `fast_lr=0.1`, `slow_freq=2`, task reset | 0,1,2,3 | 0.5988 +/- 0.0054 | 0 | Complete; merges behavior-equivalent no-op config dirs |
+| RMT ablation candidate | Fast memory, `n_mem=1`, `fast_lr=0.1`, `slow_freq=2`, task reset | 0 | 0.5988 | 2 | Needs seeds 1,2 if claiming one token is sufficient |
+| RMT ablation candidate | Batch recurrent, `n_mem=2`, `slow_freq=2`, task reset | 0 | 0.4864 | 2 | Needs seeds 1,2 only if retained as a reported ablation |
+| RMT optional | Meta fast memory | 0 | 0.5721 | 2 | Needs seeds 1,2 if included |
+
+Current shortest path for a 3-seed main comparison using Base, CBP, SWR, RMT baseline task-reset, and RMT fast memory is:
+
+- RMT baseline task-reset: run clean seed `0` if strict clean metadata is required. The old seed-0 metric exists, but its saved config was overwritten by a failed `n_mem=32` launch.
+- If we repair/accept the old RMT baseline seed-0 metadata, the main comparison has enough seeds.
+
+Additional ablation seeds:
+
+- Fast memory `n_mem=1`: run seeds `1,2` if we want a supported one-token claim.
+- Batch recurrent: run seeds `1,2` only if the poor seed-0 result is still worth reporting.
+- Shrink-and-perturb: run seeds `1,2` if it remains in the paper comparison.
+- Meta fast memory: run seeds `1,2` if included as an RMT variant.
 
 ## Baselines
 
@@ -123,4 +154,5 @@ Excluded:
 - Full replay means final-task accuracy is not a strict continual-learning metric. Use task-start recovery, per-task AUC, and early-after-switch metrics when those summaries are available.
 - Dynamic late-task switch runs are tracked as full ablations when their metric arrays are complete. They are not treated as incomplete solely because hyperparameters changed after task 15.
 - Result directories under `results/vit_incremental_cifar/...` are legacy/original-paper locations. Result directories under `experiments/vit_incremental_cifar/results/...` are the newer RMT-oriented local outputs.
-- The new `batch_recurrent` no-batch-average memory ablation has a config, but it is not listed here until a completed canonical run exists.
+- `batch_recurrent` now has completed seed 0 in the paper-required coverage table; it underperformed strongly, so only run more seeds if we decide to report it as an ablation.
+- The paper-required seed coverage table is fresher than the older exhaustive inventory sections below it; prefer that table for current run planning.

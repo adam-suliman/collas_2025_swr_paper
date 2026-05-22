@@ -24,7 +24,7 @@
   "rmt_n_layers": 8,
   "rmt_n_heads": 12,
   "rmt_mlp_ratio": 4.0,
-  "rmt_n_mem": 32,
+  "rmt_n_mem": 2,
   "rmt_fast_lr": 0.1,
   "rmt_slow_update_freq": 2,
   "rmt_memory_reset_at_task_boundary": true,
